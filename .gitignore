@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Project specific - ignore config files across the project
+**/config/settings.yaml
+**/config/local.yaml
+**/config/sessions/*.json
+
+# Logs
+*.log
+logs/
+
