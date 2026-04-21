@@ -1,0 +1,37 @@
+# Mini Claw Docker Compose
+#
+# 使用方式:
+#   cd mini_claw/deploy
+#   cp .env.example .env   # 编辑填入 API keys
+#   docker compose up -d
+#
+# Build context 为 Codeclaw 根目录，因此 mini_claude 和 mini_claw 都能打进镜像。
+
+services:
+  mini_claw:
+    build:
+      context: ../..
+      dockerfile: mini_claw/deploy/Dockerfile
+    container_name: mini_claw
+    ports:
+      - "${MINI_CLAW_PORT:-8080}:8080"
+    env_file:
+      - .env
+    volumes:
+      # 记忆数据持久化
+      - mini_claw_data:/app/mini_claw/data
+      # 消息日志持久化
+      - mini_claw_logs:/app/mini_claw/logs
+      # 引擎工作目录
+      - mini_claw_workspace:/workspace
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+volumes:
+  mini_claw_data:
+  mini_claw_logs:
+  mini_claw_workspace:

@@ -1,0 +1,16 @@
+# mini_claw Brain LLM 配置
+# Brain 使用独立的 LLM 进行思考和决策，可以用比执行引擎更轻量的模型
+
+brain:
+  # 为空时复用 mini_claude 的配置
+  model: ""
+  api_key: ""
+  base_url: ""
+
+  # Brain 思考参数（倾向确定性）
+  temperature: 0.3
+  max_tokens: 1024
+
+  # 分类任务参数（更确定、更短）
+  classify_temperature: 0.1
+  classify_max_tokens: 256

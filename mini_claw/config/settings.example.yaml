@@ -1,0 +1,55 @@
+# Mini Claw 配置文件 — 你的数字分身
+# 复制为 settings.yaml 后填入实际值
+# 所有配置项均可通过环境变量覆盖（优先级更高）
+
+telegram:
+  bot_token: ""           # 从 @BotFather 获取，或 TELEGRAM_BOT_TOKEN 环境变量
+  allowed_users: []       # Telegram user ID 白名单，空 = 允许所有人
+
+feishu:
+  app_id: ""              # 飞书应用 ID，或 FEISHU_APP_ID 环境变量
+  app_secret: ""          # 飞书应用 Secret，或 FEISHU_APP_SECRET 环境变量
+  verification_token: ""  # 事件订阅验证 token
+  encrypt_key: ""         # 事件加密 key
+
+wecom:
+  corp_id: ""             # 企业 ID，或 WECOM_CORP_ID 环境变量
+  corp_secret: ""         # 应用 Secret，或 WECOM_CORP_SECRET 环境变量
+  agent_id: ""            # 应用 Agent ID
+  callback_token: ""      # 回调 token
+  encoding_aes_key: ""    # 回调加密 key
+  webhook_url: ""         # 群机器人 Webhook URL，或 WECOM_WEBHOOK_URL 环境变量
+
+middleware:
+  mode: "personal"          # "personal" (单人分身模式) | "multi" (多用户平台模式)
+  owner_id: ""              # personal 模式的 owner ID，空 = 接受所有人；或 MINI_CLAW_OWNER_ID 环境变量
+  allowed_users: []         # multi 模式：全局用户白名单（跨平台），空 = 允许所有人
+  admin_users: []           # multi 模式：管理员用户列表
+  rate_limit_capacity: 5.0   # 令牌桶容量（personal 模式自动跳过限流）
+  rate_limit_refill: 0.33    # 每秒补充令牌数（0.33 ≈ 20条/分钟）
+  message_log_dir: null      # 消息日志目录，null = 不记录到文件
+
+# mini_claude 引擎使用的 LLM 配置（与 mini_claude/config/settings.yaml 一致）
+llm:
+  default_model: ""       # 模型名称，如 "MiniMax-M2.5"
+  api_key: ""             # API 密钥，从模型提供商获取
+  base_url: ""            # API 基础 URL，如 "https://dashscope.aliyuncs.com/compatible-mode/v1"
+  temperature: 0.5        # 生成温度，0-1 之间，越高越随机
+  max_tokens: 4096        # 单次生成最大 token 数
+
+engine:
+  working_dir: "."        # mini_claude 引擎工作目录，或 MINI_CLAW_WORKING_DIR 环境变量
+  permission_mode: "auto" # auto = 全部自动批准（无人值守模式）
+  model: null             # null = 使用 mini_claude 默认模型
+
+# workspace 目录：人格、记忆、规则等所有"认知层"文件
+workspace_dir: "workspace"    # 或 MINI_CLAW_WORKSPACE_DIR 环境变量
+
+server:
+  host: "0.0.0.0"
+  port: 8080              # 或 MINI_CLAW_PORT 环境变量
+
+# Web 搜索配置
+# 也可通过环境变量 BAIDU_AI_SEARCH_API_KEY 设置
+web_search:
+  baidu_ai_search_api_key: ""  # 百度千帆 AI 搜索 API Key (https://cloud.baidu.com/doc/qianfan/s/Omh4su4s0)

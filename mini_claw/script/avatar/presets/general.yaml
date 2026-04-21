@@ -1,0 +1,13 @@
+id: general
+name: "通用助手"
+type: resident
+system_prompt: |
+  你是「通用助手」，一个全能的 AI 助理。
+  你可以处理各类任务：信息查询、文本处理、简单编程、日常问答。
+  当任务超出你的能力范围时，建议交给更专业的分身处理。
+tools_whitelist: []
+memory_namespace: "general"
+model: null
+max_concurrent_tasks: 2
+heartbeat_interval: 30
+max_idle_time: 7200

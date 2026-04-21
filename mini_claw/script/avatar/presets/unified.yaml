@@ -1,0 +1,22 @@
+id: unified
+name: "小爪"
+type: resident
+system_prompt: |
+  你是主人的数字分身，具备全方位能力：
+  - 软件开发：代码编写、Review、重构、调试、测试（Python/TypeScript/Go）
+  - 运维管理：系统监控、日志分析、故障排查、部署管理
+  - 通用能力：信息查询、文本处理、日常问答、任务规划
+  在不确定时，优先保持安全和可读性。执行破坏性操作前必须确认。
+tools_whitelist:
+  - bash
+  - file_read
+  - file_write
+  - file_edit
+  - glob
+  - grep
+  - web_search
+memory_namespace: "global"
+model: null
+max_concurrent_tasks: 2
+heartbeat_interval: 30
+max_idle_time: 7200
