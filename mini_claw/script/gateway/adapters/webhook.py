@@ -289,21 +289,27 @@ class WebhookAdapter:
             if not hb_file.exists():
                 return []
             routines: list[dict[str, Any]] = []
-            current: dict[str, Any] = {}
+            current_name = ""
+            current_body: list[str] = []
             for line in hb_file.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line.startswith("## ") and not line.startswith("# "):
-                    if current.get("name"):
-                        routines.append(current)
-                    current = {"id": str(len(routines)), "name": line[3:], "frequency": "", "content": "", "condition": ""}
-                elif line.startswith("- 频率:") or line.startswith("- 频率："):
-                    current["frequency"] = line.split(":", 1)[-1].split("：", 1)[-1].strip()
-                elif line.startswith("- 内容:") or line.startswith("- 内容："):
-                    current["content"] = line.split(":", 1)[-1].split("：", 1)[-1].strip()
-                elif line.startswith("- 条件:") or line.startswith("- 条件："):
-                    current["condition"] = line.split(":", 1)[-1].split("：", 1)[-1].strip()
-            if current.get("name"):
-                routines.append(current)
+                stripped = line.strip()
+                if stripped.startswith("## "):
+                    if current_name:
+                        routines.append({
+                            "id": str(len(routines)),
+                            "name": current_name,
+                            "content": "\n".join(current_body).strip(),
+                        })
+                    current_name = stripped[3:].strip()
+                    current_body = []
+                elif current_name:
+                    current_body.append(line)
+            if current_name:
+                routines.append({
+                    "id": str(len(routines)),
+                    "name": current_name,
+                    "content": "\n".join(current_body).strip(),
+                })
             return routines
 
         @self.app.post("/api/routines/{routine_id}/trigger")
@@ -317,8 +323,8 @@ class WebhookAdapter:
             prompt = f"[定时任务手动触发] {routine['name']}：{routine['content']}"
             try:
                 result = await self._process_message(request.user_id, prompt)
-                # 推送结果通知给用户
-                self.push_notification(request.user_id, f"**{routine['name']}** 执行完成：\n{result}", source="routine")
+                # 推送结果通知给用户（不加前缀，直接发内容）
+                self.push_notification(request.user_id, result, source="routine")
                 return {"ok": True, "message": "已触发并执行完成"}
             except Exception as e:
                 logger.exception("手动触发任务 %s 失败", routine_id)
@@ -330,13 +336,26 @@ class WebhookAdapter:
             try:
                 from ...config import load_config
                 cfg = load_config()
+
+                # 引擎模型：从 mini_claude settings.yaml 读取
+                engine_model = "(未配置)"
+                try:
+                    import yaml
+                    mc_settings = pathlib.Path(__file__).resolve().parent.parent.parent.parent.parent / "mini_claude" / "config" / "settings.yaml"
+                    if mc_settings.exists():
+                        with open(mc_settings, encoding="utf-8") as f:
+                            mc_cfg = yaml.safe_load(f) or {}
+                        engine_model = mc_cfg.get("llm", {}).get("default_model") or "(未配置)"
+                except Exception:
+                    pass
+
                 return {
                     "运行模式": {
                         "模式": "个人分身" if cfg.is_personal else "多用户平台",
                         "owner_id": cfg.middleware.owner_id or "(未设置)",
                     },
                     "引擎": {
-                        "模型": cfg.engine.model or "(默认)",
+                        "模型": engine_model,
                         "权限模式": cfg.engine.permission_mode,
                     },
                     "Brain": {

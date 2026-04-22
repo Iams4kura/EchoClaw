@@ -3,7 +3,7 @@
 每分钟检查一次，匹配到期任务后构造 UnifiedMessage 送入 Brain 认知循环。
 
 系统任务（RoutineJob）：精确 cron 调度，调度器判断 _should_run。
-心跳任务（HeartbeatTask）：每小时唤醒，由模型自主判断是否执行。
+心跳任务（HeartbeatTask）：每小时唤醒，直接交给模型自主执行。
 """
 
 import asyncio
@@ -47,8 +47,8 @@ class RoutineScheduler:
         self._heartbeat_interval: int = 3600  # 1 小时
         self._heartbeat_task: Optional[asyncio.Task[None]] = None
         self._heartbeat_log: Dict[str, str] = {}  # name → 最近一次执行时间
-        self._on_heartbeat_judge: Optional[Callable[[str], Awaitable[str]]] = None
         self._workspace_root = Path(workspace_root) if workspace_root else None
+        self._last_interaction: Optional[str] = None  # 最后一次与用户互动的时间
 
     def load_builtin(self) -> None:
         """加载内置任务。"""
@@ -57,13 +57,37 @@ class RoutineScheduler:
         logger.info("加载 %d 个内置 Routine 任务", len(builtins))
 
     def load_heartbeat_tasks(self, tasks: List[HeartbeatTask]) -> None:
-        """加载心跳任务（由模型自主判断是否执行）。"""
+        """加载心跳任务（由模型自主执行）。"""
         self._heartbeat_tasks = tasks
         # 从持久化文件恢复执行记录
         self._load_heartbeat_state()
+
+        # 收集当前有效的任务名
+        current_names = {t.name for t in tasks}
+
+        # 清理 heartbeat_log 中已不存在的旧 key（任务重命名时遗留）
+        stale_keys = [k for k in self._heartbeat_log if k not in current_names]
+        for k in stale_keys:
+            logger.info("清理旧心跳记录: %s", k)
+            del self._heartbeat_log[k]
+        if stale_keys:
+            self._save_heartbeat_state()
+
         for t in self._heartbeat_tasks:
-            t.last_executed = self._heartbeat_log.get(t.name)
+            state = self._heartbeat_log.get(t.name)
+            if isinstance(state, dict):
+                t.last_executed = state.get("last_executed")
+                t.meta = state.get("meta", {})
+            elif isinstance(state, str):
+                # 兼容旧格式（纯字符串时间）
+                t.last_executed = state
         logger.info("加载 %d 个心跳任务", len(tasks))
+
+    def record_interaction(self) -> None:
+        """记录一次与用户的互动（用户对话、新闻推送等都算）。"""
+        self._last_interaction = datetime.now().strftime("%Y-%m-%d %H:%M")
+        # 持久化到心跳状态文件
+        self._save_heartbeat_state()
 
     def load_from_config(self, config_data: List[Dict[str, Any]]) -> None:
         """从配置数据加载自定义任务。"""
@@ -153,7 +177,6 @@ class RoutineScheduler:
                 "name": t.name,
                 "type": "heartbeat",
                 "description": t.description,
-                "condition": t.condition,
                 "last_executed": self._heartbeat_log.get(t.name, "从未执行"),
             })
         return result
@@ -270,80 +293,74 @@ class RoutineScheduler:
     # ── 心跳系统 ─────────────────────────────────────────────
 
     async def _heartbeat_loop(self) -> None:
-        """心跳循环：每 _heartbeat_interval 秒唤醒一次，让模型判断任务。"""
+        """心跳循环：每 _heartbeat_interval 秒唤醒一次，逐个触发任务。"""
         while self._running:
             await asyncio.sleep(self._heartbeat_interval)
-            if self._heartbeat_tasks and self._on_heartbeat_judge:
+            if self._heartbeat_tasks:
                 try:
                     await self._heartbeat_check()
                 except Exception as e:
                     logger.error("心跳检查异常: %s", e)
 
     async def _heartbeat_check(self) -> None:
-        """核心：把所有心跳任务打包发给模型，由模型逐个判断是否执行。"""
+        """心跳检查：逐个触发任务，由模型自主判断和执行。"""
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-        task_list = []
-        for t in self._heartbeat_tasks:
-            last = self._heartbeat_log.get(t.name, "从未执行")
-            task_list.append(
-                f"- 任务: {t.description}\n  条件: {t.condition}\n  上次执行: {last}"
-            )
-
-        content = (
-            f"[心跳检查] 当前时间: {now}\n\n"
-            "以下是你的心跳任务列表，请逐个判断现在是否需要执行：\n\n"
-            f"{chr(10).join(task_list)}\n\n"
-            "对每个任务，回复 JSON 数组，格式：\n"
-            '[{"task": "任务名（与上面的任务字段一致）", "execute": true/false, "reason": "判断理由"}]\n\n'
-            "只输出 JSON 数组，不要输出其他内容。"
-        )
-
         logger.info("心跳检查开始，%d 个任务", len(self._heartbeat_tasks))
 
-        response = await self._on_heartbeat_judge(content)
-        decisions = self._parse_heartbeat_decisions(response)
+        for task in self._heartbeat_tasks:
+            try:
+                await self._trigger_heartbeat(task, now)
+            except Exception as e:
+                logger.error("心跳任务执行失败 %s: %s", task.name, e)
 
-        executed_count = 0
-        for d in decisions:
-            if d.get("execute"):
-                task = next(
-                    (t for t in self._heartbeat_tasks if t.description == d.get("task")),
-                    None,
-                )
-                if task:
-                    self._heartbeat_log[task.name] = now
-                    task.last_executed = now
-                    self._save_heartbeat_state()
-                    asyncio.create_task(self._trigger_heartbeat(task))
-                    executed_count += 1
-                    logger.info("心跳决策: 执行 [%s] — %s", d["task"], d.get("reason", ""))
-                else:
-                    logger.warning("心跳决策: 任务 [%s] 未找到", d.get("task"))
-            else:
-                logger.info("心跳决策: 跳过 [%s] — %s", d.get("task", "?"), d.get("reason", ""))
+        logger.info("心跳检查完成")
 
-        logger.info("心跳检查完成，执行 %d/%d 个任务", executed_count, len(self._heartbeat_tasks))
-
-    async def _trigger_heartbeat(self, task: HeartbeatTask) -> None:
-        """执行单个心跳任务。"""
+    async def _trigger_heartbeat(self, task: HeartbeatTask, now: str) -> None:
+        """触发单个心跳任务：构造上下文 prompt 交给 Brain→Engine 自主执行。"""
         logger.info("心跳触发: %s", task.description)
 
         if not self._on_trigger:
             logger.warning("无 on_trigger 回调，跳过心跳任务: %s", task.name)
             return
 
+        last = task.last_executed or "从未执行"
+        last_interact = self._last_interaction or "从未互动"
+        meta_str = json.dumps(task.meta, ensure_ascii=False) if task.meta else ""
+
+        prompt = (
+            f"[心跳任务] {task.description}\n"
+            f"当前时间: {now}\n"
+            f"上次执行: {last}\n"
+            f"上次与用户互动: {last_interact}\n"
+        )
+        if meta_str:
+            prompt += f"任务状态: {meta_str}\n"
+        prompt += (
+            f"\n任务内容:\n{task.prompt}\n\n"
+            "请自主判断现在是否需要执行此任务。\n"
+            "如果需要执行，直接用工具完成并输出结果。\n"
+            "如果不需要执行，简短说明原因即可（如「无更新」「已执行过」）。"
+        )
+
         msg = UnifiedMessage(
             platform="routine",
             user_id="system",
             chat_id=f"heartbeat_{task.name}",
-            content=task.prompt,
+            content=prompt,
         )
 
         try:
             await self._on_trigger(msg)
         except Exception as e:
             logger.error("心跳任务执行失败 %s: %s", task.name, e)
+
+        # 更新执行记录
+        self._heartbeat_log[task.name] = {
+            "last_executed": now,
+            "meta": task.meta,
+        }
+        task.last_executed = now
+        self._save_heartbeat_state()
 
     # ── 心跳状态持久化 ───────────────────────────────────────
 
@@ -360,6 +377,8 @@ class RoutineScheduler:
             return
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
+            # 恢复 last_interaction
+            self._last_interaction = data.pop("__last_interaction__", None)
             self._heartbeat_log = data
             logger.info("恢复心跳状态: %d 条记录", len(data))
         except (json.JSONDecodeError, OSError) as e:
@@ -371,40 +390,14 @@ class RoutineScheduler:
         if not path:
             return
         try:
+            data = dict(self._heartbeat_log)
+            # 持久化 last_interaction
+            if self._last_interaction:
+                data["__last_interaction__"] = self._last_interaction
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(
-                json.dumps(self._heartbeat_log, ensure_ascii=False, indent=2),
+                json.dumps(data, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
         except OSError as e:
             logger.warning("保存心跳状态失败: %s", e)
-
-    @staticmethod
-    def _parse_heartbeat_decisions(text: str) -> List[Dict[str, Any]]:
-        """从模型输出解析心跳决策 JSON 数组。"""
-        text = text.strip()
-
-        # 提取 ```json ... ``` 中的内容
-        if "```" in text:
-            parts = text.split("```")
-            for part in parts:
-                cleaned = part.strip()
-                if cleaned.startswith("json"):
-                    cleaned = cleaned[4:].strip()
-                if cleaned.startswith("["):
-                    try:
-                        return json.loads(cleaned)
-                    except json.JSONDecodeError:
-                        continue
-
-        # 直接尝试解析
-        start = text.find("[")
-        end = text.rfind("]")
-        if start != -1 and end != -1 and end > start:
-            try:
-                return json.loads(text[start:end + 1])
-            except json.JSONDecodeError:
-                pass
-
-        logger.warning("无法解析心跳决策 JSON: %s", text[:200])
-        return []

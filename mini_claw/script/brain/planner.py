@@ -35,6 +35,11 @@ class TaskPlanner:
             memory_lines = [f"- {m.name}: {m.description}" for m in ctx.relevant_memories]
             memory_context = "相关记忆:\n" + "\n".join(memory_lines)
 
+        conversation_context = ""
+        if ctx.recent_conversation:
+            lines = [f"{t['role']}: {t['content'][:150]}" for t in ctx.recent_conversation[-4:]]
+            conversation_context = "最近对话（帮助理解指代）:\n" + "\n".join(lines)
+
         system_prompt = f"""{ctx.soul_fragment}
 
 你是一个任务规划助手。将复杂任务分解为有序的执行步骤。"""
@@ -43,6 +48,8 @@ class TaskPlanner:
 
 ## 任务
 {task}
+
+{conversation_context}
 
 {memory_context}
 
