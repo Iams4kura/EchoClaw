@@ -55,6 +55,8 @@ class BrainLLMClient:
         self._llm = LLMClient(mc_config)
         self._fallback_mc_config = fallback_mc_config
 
+    _NO_TOOL_CALL = "\n\n【重要】你没有任何工具可以调用。不要输出任何 tool_call、function_call 或 XML 标签格式的调用。直接用纯文本回复。"
+
     async def think(self, system_prompt: str, user_prompt: str) -> str:
         """单次思考调用，返回纯文本。
 
@@ -62,7 +64,9 @@ class BrainLLMClient:
         """
         messages = []
         if system_prompt:
-            messages.append(Message(role="system", content=system_prompt))
+            messages.append(Message(role="system", content=system_prompt + self._NO_TOOL_CALL))
+        else:
+            messages.append(Message(role="system", content=self._NO_TOOL_CALL.strip()))
         messages.append(Message(role="user", content=user_prompt))
 
         try:
@@ -74,6 +78,33 @@ class BrainLLMClient:
             return self._extract_text(response)
         except Exception as e:
             logger.error("Brain think 调用失败: %s", e)
+            raise
+
+    async def chat(
+        self,
+        system: str,
+        user: str,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        """单次对话调用，支持覆盖温度参数。
+
+        用于：主动问候等需要特殊温度的场景。
+        """
+        messages = [
+            Message(role="system", content=system + self._NO_TOOL_CALL),
+            Message(role="user", content=user),
+        ]
+
+        try:
+            response = await self._llm.complete(
+                messages=messages,
+                temperature=temperature if temperature is not None else self._config.temperature,
+                max_tokens=max_tokens if max_tokens is not None else self._config.max_tokens,
+            )
+            return self._extract_text(response)
+        except Exception as e:
+            logger.error("Brain chat 调用失败: %s", e)
             raise
 
     async def classify(self, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
@@ -102,9 +133,8 @@ class BrainLLMClient:
     def _extract_text(response: Any) -> str:
         """从 LLMClient 响应中提取文本内容。"""
         if isinstance(response, str):
-            return response
-        # LLMClient.complete() 返回的可能是 LLMResponse 对象
-        if hasattr(response, "content"):
+            text = response
+        elif hasattr(response, "content"):
             content = response.content
             if isinstance(content, list):
                 # TextBlock 列表
@@ -114,9 +144,16 @@ class BrainLLMClient:
                         texts.append(block.text)
                     elif isinstance(block, str):
                         texts.append(block)
-                return "\n".join(texts)
-            return str(content)
-        return str(response)
+                text = "\n".join(texts)
+            else:
+                text = str(content)
+        else:
+            text = str(response)
+        # 清理模型可能误输出的 tool_call XML
+        import re
+        text = re.sub(r"<(?:minimax|anthropic|openai):tool_call>[\s\S]*?</(?:minimax|anthropic|openai):tool_call>", "", text)
+        text = re.sub(r"<(?:tool_call|invoke|FunctionCall)>[\s\S]*?</(?:tool_call|invoke|FunctionCall)>", "", text)
+        return text.strip()
 
     @staticmethod
     def _parse_json(text: str) -> Dict[str, Any]:

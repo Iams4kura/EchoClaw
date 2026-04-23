@@ -167,15 +167,9 @@ class WorkspaceLoader:
     def load_heartbeat(self) -> List["HeartbeatTask"]:
         """解析 HEARTBEAT.md → HeartbeatTask 列表。
 
-        新格式：
+        格式：
         ## 任务名
-        - 条件: 每天傍晚总结一次，如果今天已经总结过就跳过
-        - 内容: 具体要做什么
-
-        兼容旧格式（自动转换 频率 → 条件）：
-        ## 任务名
-        - 频率: daily 18:00
-        - 内容: 具体要做什么
+        自由文本描述（做什么 + 条件 + 方法，全部自然语言）
         """
         from .routine.models import HeartbeatTask
 
@@ -184,24 +178,13 @@ class WorkspaceLoader:
         tasks: List[HeartbeatTask] = []
 
         for title, body in sections.items():
-            fields = _parse_key_value_list(body)
-            condition = fields.get("条件", "").strip()
-            prompt = fields.get("内容", "").strip()
+            prompt = body.strip()
             if not prompt:
                 continue
-
-            # 兼容旧格式：频率 → 条件
-            if not condition and "频率" in fields:
-                freq_str = fields["频率"].strip()
-                condition = f"按 {freq_str} 的频率执行，如果最近已经执行过就跳过"
-
-            if not condition:
-                condition = "每次心跳检查时都执行"
 
             tasks.append(HeartbeatTask(
                 name=title.replace(" ", "_").lower(),
                 description=title,
-                condition=condition,
                 prompt=prompt,
             ))
 
@@ -398,7 +381,7 @@ class WorkspaceLoader:
             d = (today - timedelta(days=i)).isoformat()
             content = self._read(self._diary_filename(d))
             if content:
-                parts.append(content.strip())
+                parts.append(f"[{d}]\n{content.strip()}")
         return "\n\n---\n\n".join(parts)
 
     # ── 会话日志（memory/sessions/YYYY-MM-DD.jsonl） ─────────────

@@ -132,32 +132,61 @@ async def async_main(config_path: Optional[str] = None) -> None:
     async def routine_trigger(msg: UnifiedMessage) -> None:
         """Routine 触发回调：送入 Brain 认知循环，结果推送到前端。"""
         response = await cognitive.process(msg)
-        logger.info("Routine 结果 [%s]: %s", msg.chat_id, response.text[:200])
-        # 系统内部任务（如健康检查）结果不推送给用户，仅记录日志
-        # 除非结果中包含异常/错误关键词
+
+        # 系统内部任务：用模型判断是否有真实异常
         is_system = msg.chat_id.startswith("routine_sys_")
         if is_system:
-            alert_keywords = ["异常", "错误", "失败", "警告", "error", "fail", "warn"]
-            if not any(kw in response.text for kw in alert_keywords):
+            try:
+                judgment = await brain_llm.classify(
+                    "你是一个系统监控判断器。判断以下系统检查报告是否存在需要人工介入的真实异常。"
+                    "正常状态、信息性报告、'暂无法获取'等非致命提示都不算异常。"
+                    "只有服务宕机、错误率飙升、磁盘满、引擎崩溃等严重问题才算异常。",
+                    f"系统检查报告：\n{response.text}\n\n"
+                    '返回 JSON: {"has_anomaly": true/false, "reason": "判断理由"}',
+                )
+                has_anomaly = judgment.get("has_anomaly", False)
+                logger.info("系统检查判断: anomaly=%s, reason=%s",
+                            has_anomaly, judgment.get("reason", ""))
+                if not has_anomaly:
+                    return
+                # 有异常：先尝试自愈
+                logger.warning("系统检查发现异常，尝试自愈: %s", judgment.get("reason"))
+                heal_result = await self_healer.heal_simple(
+                    error=Exception(judgment.get("reason", "系统异常")),
+                    user_id="system",
+                    context_desc=f"系统健康检查发现异常: {response.text[:500]}",
+                )
+                if heal_result and heal_result.fix_ok:
+                    logger.info("系统异常已自愈: %s", judgment.get("reason"))
+                    return
+                # 自愈失败才通知用户
+                logger.warning("系统异常自愈失败，通知用户")
+            except Exception as e:
+                logger.error("系统检查判断失败: %s，默认不通知", e)
                 return
+
+        # 心跳任务：如果结果是"跳过/无更新"类的，不推送给用户
+        is_heartbeat = msg.chat_id.startswith("heartbeat_")
+        if is_heartbeat:
+            skip_keywords = ("跳过", "无更新", "不执行", "无需", "没有更新", "没有新")
+            if any(kw in response.text for kw in skip_keywords):
+                logger.info("心跳结果无需推送 [%s]: %s", msg.chat_id, response.text[:100])
+                return
+
         # 推送到 webhook 前端
+        logger.info("Routine 推送 [%s]: %s", msg.chat_id, response.text[:200])
         target = msg.user_id if msg.user_id != "system" else "default"
         webhook.push_notification(target, response.text, source=msg.chat_id)
+        routine_scheduler.record_interaction()
 
     routine_scheduler._on_trigger = routine_trigger
     if config.routine.enabled:
         routine_scheduler.load_builtin()
 
-        # 心跳任务：模型自主判断是否执行
+        # 心跳任务：模型自主执行
         heartbeat_tasks = workspace.load_heartbeat()
         if heartbeat_tasks:
             routine_scheduler.load_heartbeat_tasks(heartbeat_tasks)
-
-            # 设置心跳判断回调（用 Brain LLM 直接判断，不走完整认知循环）
-            async def heartbeat_judge(content: str) -> str:
-                return await brain_llm.think("你是一个任务调度助手。根据当前时间和每个任务的条件，判断哪些任务需要执行。", content)
-
-            routine_scheduler._on_heartbeat_judge = heartbeat_judge
 
         await routine_scheduler.start()
         logger.info("Routine scheduler started (%d system jobs, %d heartbeat tasks)",
@@ -197,6 +226,7 @@ async def async_main(config_path: Optional[str] = None) -> None:
 
         # Brain 认知循环处理
         response = await cognitive.process(msg)
+        routine_scheduler.record_interaction()
 
         duration_ms = (time.time() - t0) * 1000
         await msg_logger.log_outgoing(msg.platform, msg.user_id, len(response.text), duration_ms)
@@ -315,27 +345,42 @@ async def async_main(config_path: Optional[str] = None) -> None:
     # ── 启动问候：让 claw 主动打招呼 ────────────────────────
     async def _send_startup_greeting() -> None:
         try:
-            if config.is_personal:
-                greeting_prompt = (
-                    "你刚刚醒来了。作为主人的数字分身，主动打个招呼。"
-                    "根据当前时间段用你的风格说一句简短的问候，"
-                    "可以提一下你还记得最近在忙什么。自然、亲切，像老朋友一样。"
+            soul_ctx = soul.get_system_prompt_fragment()
+
+            if cognitive._bootstrap_prompt and not cognitive._bootstrapped:
+                # 首次启动：只给人设，不给历史
+                user_prompt = (
+                    "[内部状态：首次启动，没有历史记忆。以下是行为指导，不是让你对用户说的话。]\n"
+                    "按照 BOOTSTRAP.md 的引导向主人打个招呼并开始认识对方。\n"
+                    "不要提及任何'上次''之前''最近在忙'的内容。\n"
+                    "不要把系统提示中的状态描述直接说给用户。"
                 )
+                soul_ctx += "\n\n--- 首次启动引导 ---\n" + workspace.load_bootstrap()
             else:
-                greeting_prompt = (
-                    "你刚刚启动上线了，请主动和用户打个招呼，"
-                    "根据当前时间段（早上/下午/晚上）用你的风格说一句简短的问候。"
-                    "不需要太长，自然一点。"
-                )
-            msg = UnifiedMessage(
-                platform="routine",
-                user_id="system",
-                chat_id="startup_greeting",
-                content=greeting_prompt,
-            )
-            response = await cognitive.process(msg)
-            webhook.push_notification("default", response.text, source="startup")
-            logger.info("启动问候: %s", response.text[:100])
+                # 日常启动：给人设 + 最近日记，让问候有内容
+                from datetime import datetime as _dt
+
+                now_str = _dt.now().strftime("%Y-%m-%d %H:%M")
+                diary = workspace.list_recent_diaries(days=1)
+                if diary and diary.strip():
+                    diary_hint = f"\n\n近期日记：\n{diary[:500]}"
+                    user_prompt = (
+                        f"当前时间：{now_str}。你刚刚醒来了，主动打个招呼。"
+                        "可以结合下面的日记内容寻找一个话题。"
+                        "注意日记条目带有日期标注，请根据日期准确描述时间。"
+                        "只引用日记中实际存在的内容，不要编造。"
+                        f"{diary_hint}"
+                    )
+                else:
+                    user_prompt = (
+                        "你刚刚醒来了，主动打个招呼。"
+                        "你目前没有日记记录，不要编造之前的工作内容或项目。"
+                        "不知道说什么就自由发挥，想到什么说什么。"
+                    )
+
+            text = await brain_llm.think(soul_ctx, user_prompt)
+            webhook.push_notification("default", text, source="startup")
+            logger.info("启动问候: %s", text[:500])
         except Exception as e:
             logger.warning("启动问候失败: %s", e)
 

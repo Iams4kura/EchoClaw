@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 
 class RoutineFrequency(str, Enum):
@@ -45,15 +45,15 @@ class RoutineJob:
 
 @dataclass
 class HeartbeatTask:
-    """心跳任务：由模型自主判断是否执行。
+    """心跳任务：由模型自主驱动执行。
 
     与 RoutineJob（系统定时任务）的区别：
     - RoutineJob: 精确 cron 调度，调度器判断 _should_run
-    - HeartbeatTask: 条件式触发，模型判断是否执行
+    - HeartbeatTask: 每次心跳直接交给模型，由模型自主判断和执行
     """
 
     name: str                              # 任务标识（从标题生成）
     description: str                       # 标题原文
-    condition: str                         # 自然语言触发条件
-    prompt: str                            # 执行内容
+    prompt: str                            # 自由文本：做什么 + 条件 + 方法
     last_executed: Optional[str] = None    # "2026-04-17 18:00" 或 None
+    meta: Dict[str, Any] = field(default_factory=dict)  # 任务级持久化状态

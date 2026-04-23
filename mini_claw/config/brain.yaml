@@ -8,8 +8,8 @@ brain:
   base_url: ""
 
   # Brain 思考参数（倾向确定性）
-  temperature: 0.3
-  max_tokens: 1024
+  temperature: 0.5
+  max_tokens: 2048
 
   # 分类任务参数（更确定、更短）
   classify_temperature: 0.1

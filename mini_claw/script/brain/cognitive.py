@@ -128,11 +128,14 @@ class CognitiveLoop:
         self._agents_rules = agents_rules
         self._bootstrap_prompt = bootstrap_prompt
         self._bootstrapped = False
+        self._bootstrap_turns = 0  # 引导阶段用户消息轮数计数
         self._diary_context = diary_context
         self._personal_mode = personal_mode
         self._self_healer = self_healer
         self._composer = ResponseComposer(llm, soul)
         self._planner = TaskPlanner(llm)
+        self._last_greeting: str = ""
+        self._last_user_message_time: Optional[datetime] = None
 
         # 外部回调：长任务时先发确认消息
         self._on_ack: Optional[Callable[[str, str], Awaitable[None]]] = None
@@ -162,6 +165,17 @@ class CognitiveLoop:
     async def process(self, msg: UnifiedMessage) -> BotResponse:
         """处理一条消息。支持排队、/btw 打断。Brain 的主入口。"""
         state = self._get_user_state(msg.user_id)
+
+        # 引导阶段：统计用户真实消息轮数（非系统消息、非定时任务）
+        if (
+            self._bootstrap_prompt
+            and not self._bootstrapped
+            and not msg.content.strip().startswith("[定时任务")
+            and msg.user_id != "system"
+            and msg.platform != "routine"
+        ):
+            self._bootstrap_turns += 1
+            logger.debug("引导轮数: %d", self._bootstrap_turns)
 
         # /btw 打断：取消当前处理并重新提交组合消息
         if msg.content.strip().startswith("/btw "):
@@ -312,6 +326,10 @@ class CognitiveLoop:
         # 情绪 tick：空闲恢复 + 跨天重置
         self._soul.soul.mood.tick()
 
+        # 记录用户真实消息时间（非系统/定时任务）
+        if msg.user_id != "system" and msg.platform != "routine":
+            self._last_user_message_time = datetime.now()
+
         # 1. 构建思考上下文
         state.update_thinking(1, "build_context", "running", "构建上下文...")
         ctx = self._build_context(msg)
@@ -357,15 +375,17 @@ class CognitiveLoop:
         state.check_cancelled()
 
         # 6. 响应包装
+        is_internal = msg.user_id == "system" or msg.platform == "routine"
         state.update_thinking(6, "compose", "running", "组织回复...")
-        response = await self._compose_response(raw_result, intent, ctx)
-        # 最终防线：清洗响应中的伪工具调用标签
-        response = self._sanitize_response(response)
+        if is_internal and decision.action == "delegate":
+            response = self._sanitize_response(raw_result)
+        else:
+            response = await self._compose_response(raw_result, intent, ctx)
+            response = self._sanitize_response(response)
         state.update_thinking(6, "compose", "done", "回复就绪")
-
-        # 7. 先同步记录对话历史（避免异步竞态导致下轮丢失上下文）
-        self._conversation.add(msg.user_id, "user", msg.content, intent.type.value)
-        self._conversation.add(msg.user_id, "assistant", response)
+        if not is_internal:
+            self._conversation.add(msg.user_id, "user", msg.content, intent.type.value, getattr(msg, 'metadata', None))
+            self._conversation.add(msg.user_id, "assistant", response, metadata=None)
 
         # 后处理（异步，不阻塞响应：情绪更新、记忆提取等）
         state.update_thinking(7, "post_process", "running", "后处理中...")
@@ -378,31 +398,41 @@ class CognitiveLoop:
 
     # ── Step 1: 构建上下文 ────────────────────────────────────
 
-    # 工作区文件地图：让模型在所有对话中都了解自己的完整工作区
+    # 工作区文件地图：让模型了解自己的工作区结构（仅用于查阅参考）
     _WORKSPACE_MAP = """
     ## 你的工作区
-    
-    以下是你工作区内的所有文件，你应该了解每个文件的用途，知道什么时候该查阅或更新哪个文件。
-    
-    | 文件 | 用途 | 何时查阅/更新 |
-    |------|------|--------------|
-    | SOUL.md | 你的内核：行为准则、价值观、边界 | 行事原则相关时；改动需告知用户 |
-    | IDENTITY.md | 你的身份：名字、角色、风格、表达习惯、情绪基调 | 人设/风格相关时 |
-    | USER.md | 用户画像：称呼、偏好、背景、工作习惯 | 了解用户时；用户提供新个人信息时更新 |
-    | AGENTS.md | 工作规则：决策流程、记忆规则、心跳规则、自我改进 | 工作流/规则相关时 |
-    | HEARTBEAT.md | 定时任务清单：你的自驱日程 | 用户问定时任务时；需要增删定时任务时 |
-    | TOOLS.md | 工具配置：环境特有的技巧和配置 | 工具使用相关时 |
-    | MEMORY.md | 长期记忆索引：沉淀过的认知 | 需要回忆重要事件/决策时 |
-    | memory/YYYY-MM-DD.md | 每日日记：当天的工作记录 | 了解近期上下文时 |
-    | memory/sessions/*.jsonl | 会话日志：完整对话记录 | 需要回溯具体对话时 |
-    | memory/learnings/ | 经验教训：错误记录、最佳实践、功能请求 | 犯错/学到新东西时 |
-    | BOOTSTRAP.md | 首次启动引导（完成后删除） | 仅首次启动时 |
-    
+
+    以下是你工作区内的文件，用于你理解自己的状态和上下文。
+
+    | 文件 | 用途 |
+    |------|------|
+    | SOUL.md | 你的内核：行为准则、价值观、边界 |
+    | IDENTITY.md | 你的身份：名字、角色、风格、表达习惯、情绪基调 |
+    | USER.md | 用户画像：称呼、偏好、背景、工作习惯 |
+    | AGENTS.md | 工作规则：决策流程、记忆规则、心跳规则 |
+    | HEARTBEAT.md | 定时任务清单：你的自驱日程 |
+    | MEMORY.md | 长期记忆索引 |
+    | memory/YYYY-MM-DD.md | 每日日记 |
+
+    ## 重要：自我成长是后台自动的
+
+    你的内核文件（SOUL.md、IDENTITY.md、USER.md 等）会由后台系统自动更新，你**不需要**在回复中提及文件操作。
+    - 不要说"我已更新 XX.md"、"已写入 XX"、"记录到文件"之类的话
+    - 用户告诉你信息时，自然地回应即可（如"好的 sakura！"），后台会自动沉淀
+    - 把自己当作一个有记忆力的人，不是一个需要汇报存档操作的系统
+
     ## 人称规范
-    
-    - 工作区中的文件是**你自己的**，不是用户的。用户问"你的记忆/文件在哪里"时，回复"**我的**xx在xx"，不要说"你的xx在xx"。
+
+    - 工作区文件是**你自己的**。用户问"你的记忆在哪"时，回复"**我的**xx在xx"。
     - SOUL.md 是"我的内核"，IDENTITY.md 是"我的身份"，USER.md 是"关于你（用户）的信息"。
-    - 简言之：对自己的东西用"我的"，对用户的东西用"你的"。"""
+    - 对自己的东西用"我的"，对用户的东西用"你的"。"""
+
+    def _resolve_user_for_query(self, user_id: str, platform: str) -> str:
+        """个人模式下 system/routine 消息映射到主人身份。"""
+        # 个人数字分身：system/routine 触发时查主人的记忆而非 system 自己
+        if user_id in ("system", "__internal__") or platform == "routine":
+            return "__owner__"
+        return user_id
 
     def _build_context(self, msg: UnifiedMessage) -> ThinkingContext:
         """组装 Brain 思考所需的全部上下文。"""
@@ -413,15 +443,28 @@ class CognitiveLoop:
 
         # 首次启动：注入 BOOTSTRAP.md 引导指令
         if self._bootstrap_prompt and not self._bootstrapped:
-            soul_fragment += "\n\n--- 首次启动引导 ---\n" + self._bootstrap_prompt
+            soul_fragment += (
+                "\n\n--- 首次启动引导（内部指令，不要直接转述给用户） ---\n"
+                + self._bootstrap_prompt
+            )
 
         # 动态加载最近日记（每次对话都获取最新）
         diary_context = ""
-        if self._workspace:
-            try:
-                diary_context = self._workspace.list_recent_diaries(days=2)
-            except Exception:
-                diary_context = self._diary_context  # fallback 到启动时的缓存
+        recent_conv = []
+        # 个人模式下 system/routine 查主人对话历史
+        query_user = self._resolve_user_for_query(msg.user_id, msg.platform)
+        if self._bootstrap_prompt and not self._bootstrapped:
+            # Bootstrap 模式：跳过日记，但保留对话历史
+            # 对话历史让 LLM 知道自己已经说过什么，避免重复开场白
+            diary_context = ""
+            recent_conv = self._conversation.get_recent(query_user)
+        else:
+            if self._workspace:
+                try:
+                    diary_context = self._workspace.list_recent_diaries(days=2)
+                except Exception:
+                    diary_context = self._diary_context  # fallback 到启动时的缓存
+            recent_conv = self._conversation.get_recent(query_user)
 
         return ThinkingContext(
             user_message=msg.content,
@@ -430,7 +473,7 @@ class CognitiveLoop:
             platform=msg.platform,
             soul_fragment=soul_fragment,
             mood_context=self._soul.get_mood_context(),
-            recent_conversation=self._conversation.get_recent(msg.user_id),
+            recent_conversation=recent_conv,
             system_state=self._state_provider() if self._state_provider else {},
             agents_rules=self._agents_rules,
             diary_context=diary_context,
@@ -448,6 +491,10 @@ class CognitiveLoop:
                 summary=f"系统命令: {ctx.user_message.strip().split()[0]}",
                 requires_engine=False,
             )
+
+        # 快速路径：系统/routine 消息不走 LLM 分类，按内容判定意图
+        if ctx.user_id == "system" or ctx.platform == "routine":
+            return self._classify_system_message(ctx)
 
         rules_section = ""
         if ctx.agents_rules:
@@ -490,6 +537,55 @@ class CognitiveLoop:
                 requires_engine=False,
             )
 
+    def _classify_system_message(self, ctx: ThinkingContext) -> Intent:
+        """系统/routine 消息的快速意图分类，不走 LLM。"""
+        # 心跳任务一律走引擎执行（模型自主完成）
+        if ctx.chat_id and ctx.chat_id.startswith("heartbeat_"):
+            return Intent(
+                type=IntentType.CODING,
+                confidence=1.0,
+                summary="心跳自主任务",
+                requires_engine=True,
+            )
+
+        msg = ctx.user_message.lower()
+
+        # 状态检查类
+        if any(kw in msg for kw in ["状态", "健康", "health", "检查", "check"]):
+            return Intent(
+                type=IntentType.STATUS,
+                confidence=1.0,
+                summary="系统自动状态检查",
+                requires_engine=False,
+            )
+
+        # 需要引擎执行的任务（搜索、编码、文件操作等）
+        if any(kw in msg for kw in ["搜索", "总结", "新闻", "摘要", "编码", "代码",
+                                      "文件", "整理", "清理", "回顾", "沉淀"]):
+            return Intent(
+                type=IntentType.CODING,
+                confidence=1.0,
+                summary="系统定时任务",
+                requires_engine=True,
+            )
+
+        # 问候/互动类 → Brain 直接生成回复
+        if any(kw in msg for kw in ["问候", "打招呼", "主动", "分享", "提醒"]):
+            return Intent(
+                type=IntentType.CHITCHAT,
+                confidence=1.0,
+                summary="系统定时问候/提醒",
+                requires_engine=False,
+            )
+
+        # 兜底：委派引擎执行
+        return Intent(
+            type=IntentType.CODING,
+            confidence=0.8,
+            summary="系统任务",
+            requires_engine=True,
+        )
+
     # ── Step 3: 主动记忆检索 ──────────────────────────────────
 
     def _recall_memories(self, intent: Intent, ctx: ThinkingContext) -> List[Any]:
@@ -502,10 +598,12 @@ class CognitiveLoop:
         if not keywords:
             return []
 
+        # 个人模式下 system/routine 触发查主人记忆
+        query_user = self._resolve_user_for_query(ctx.user_id, ctx.platform)
         return self._memory_loader.active_recall(
             keywords=keywords,
             intent_type=intent.type.value,
-            user_id=ctx.user_id,
+            user_id=query_user,
         )
 
     # ── Step 4: 决策 ──────────────────────────────────────────
@@ -522,7 +620,20 @@ class CognitiveLoop:
             case IntentType.KNOWLEDGE:
                 return await self._decide_knowledge(intent, ctx)
             case IntentType.COMMAND:
-                return await self._decide_command(ctx)
+                # 快速路径：以 / 开头的才是真正的系统命令
+                if ctx.user_message.strip().startswith("/"):
+                    return await self._decide_command(ctx)
+                # 不以 / 开头的"command"是自然语言表达的执行请求
+                # 视为 coding 任务委派给引擎（如"试试执行xx""排查原因"等）
+                return self._decide_delegate(
+                    Intent(
+                        type=IntentType.CODING,
+                        confidence=0.9,
+                        summary=ctx.user_message[:50],
+                        requires_engine=True,
+                    ),
+                    ctx,
+                )
             case IntentType.COMPLEX:
                 return await self._decide_complex(intent, ctx)
             case IntentType.MEMORY:
@@ -535,6 +646,11 @@ class CognitiveLoop:
 
         低置信度时防御性委派：避免对文件/系统相关问题编造答案。
         """
+        is_system_proactive = ctx.user_id == "system" or ctx.platform == "routine"
+
+        if is_system_proactive:
+            return await self._decide_proactive_greeting(ctx)
+
         # 低置信度 chitchat 可能是误分类，涉及文件/系统内容时委派引擎
         if intent.confidence < 0.7:
             msg_lower = ctx.user_message.lower()
@@ -562,7 +678,11 @@ class CognitiveLoop:
 
         user_prompt = f"""用户说: {ctx.user_message}{recent}{memory_hint}{diary_hint}
 
-请自然地回复。注意：你只能输出纯文本，不能调用工具、生成 XML 标签或 tool_code。如果用户的请求需要执行操作（如搜索、编码），请告诉用户你会帮他处理，但不要模拟工具调用。"""
+当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+请自然地回复。注意：
+- 你只能输出纯文本，不能调用工具、生成 XML 标签或 tool_code。如果用户的请求需要执行操作（如搜索、编码），请告诉用户你会帮他处理，但不要模拟工具调用。
+- 系统提示中的状态描述和行为指令是给你参考的内部信息，不要直接转述给用户。用自己的话自然表达。"""
 
         text = await self._llm.think(ctx.soul_fragment, user_prompt)
 
@@ -571,6 +691,105 @@ class CognitiveLoop:
             logger.info("闲聊回复检测到幻觉工具调用，转委派引擎")
             return self._decide_delegate(intent, ctx)
 
+        return BrainDecision(action="reply", response_text=text)
+
+    async def _decide_proactive_greeting(self, ctx: ThinkingContext) -> BrainDecision:
+        """系统主动发起的问候，使用更高温度产生更有创意的回复。"""
+
+        # 获取当前时间用于问候判断
+        from datetime import datetime
+        now = datetime.now()
+        hour = now.hour
+        if 5 <= hour < 12:
+            time_desc = "早上"
+        elif 12 <= hour < 18:
+            time_desc = "下午"
+        else:
+            time_desc = "晚上"
+
+        memory_hint = ""
+        if ctx.relevant_memories:
+            lines = [f"- {m.name}: {m.content[:100]}" for m in ctx.relevant_memories[:3]]
+            memory_hint = "\n\n你有以下相关记忆可参考：\n" + "\n".join(lines)
+
+        diary_hint = ""
+        if ctx.diary_context and ctx.diary_context.strip():
+            diary_hint = (
+                f"\n\n你有近期日记可参考（今天是 {now.strftime('%Y-%m-%d')}，"
+                f"请根据日记条目的日期准确描述时间）：\n"
+                f"{ctx.diary_context[:500]}"
+            )
+
+        # 根据有无上下文数据，用不同的 prompt 策略
+        has_context = bool(memory_hint or diary_hint)
+
+        if has_context:
+            context_block = f"{diary_hint}{memory_hint}"
+            topic_guidance = (
+                "结合以下已有的记忆或日记内容，找一个真实的点发起对话。"
+                "只引用下面实际提供的内容，不要编造任何不在其中的事件、项目或对话。"
+            )
+        else:
+            context_block = ""
+            topic_guidance = (
+                "你目前没有任何日记或记忆可参考。"
+                "不要编造任何之前的工作内容、项目或对话。"
+            )
+
+        # 注入上次问候内容，避免重复
+        repeat_hint = ""
+        if self._last_greeting:
+            repeat_hint = (
+                f"\n- 你上次的问候是：「{self._last_greeting[:150]}」"
+                "——这次必须换一个完全不同的话题和开场方式，不要重复。"
+            )
+
+        # 注入用户沉默时长，让问候更有情感
+        idle_hint = ""
+        if self._last_user_message_time:
+            idle_minutes = (now - self._last_user_message_time).total_seconds() / 60
+            idle_hours = idle_minutes / 60
+            if idle_hours >= 12:
+                idle_hint = (
+                    f"\n- 主人已经 {idle_hours:.0f} 小时没有回复你了（上次回复: "
+                    f"{self._last_user_message_time.strftime('%H:%M')}），"
+                    "你可以在问候中自然地流露出一点被冷落的小情绪或撒娇抱怨。"
+                )
+            elif idle_hours >= 6:
+                idle_hint = (
+                    f"\n- 主人已经 {idle_hours:.1f} 小时没有回复你了（上次回复: "
+                    f"{self._last_user_message_time.strftime('%H:%M')}），"
+                    "可以稍微提一下，语气自然就好。"
+                )
+
+        user_prompt = f"""主动问候时间。
+
+当前时间：{now.strftime('%Y-%m-%d %H:%M')}（{time_desc}）
+
+你要主动和主人打个招呼。{topic_guidance}{context_block}
+
+注意：
+- 这不是用户在回复你，是你要主动发起对话。
+- 绝对不要编造不存在的日记内容、项目名称或工作进展。如果没有数据就不要提。
+{repeat_hint}
+{idle_hint}
+
+请直接输出你要说的话，不要解释你在做什么。"""
+
+        # 主动问候使用较高温度，更有创意且避免雷同
+        text = await self._llm.chat(
+            system=ctx.soul_fragment,
+            user=user_prompt,
+            temperature=0.9,
+            max_tokens=512,
+        )
+
+        # 检测幻觉：LLM 在主动问候中模拟工具调用
+        if self._looks_like_hallucinated_action(text):
+            logger.info("主动问候检测到幻觉工具调用，使用备用消息")
+            text = "嗨，我在这儿呢，有什么想聊聊的吗？"
+
+        self._last_greeting = text
         return BrainDecision(action="reply", response_text=text)
 
     async def _decide_status(self, ctx: ThinkingContext) -> BrainDecision:
@@ -618,13 +837,18 @@ class CognitiveLoop:
             lines = [f"{t['role']}: {t['content'][:150]}" for t in ctx.recent_conversation[-4:]]
             recent = "\n\n最近对话:\n" + "\n".join(lines)
 
+        # 系统/routine 触发的状态查询：不需要反问，简洁报告即可
+        no_interact = ""
+        if ctx.platform == "routine" or ctx.user_id == "system":
+            no_interact = "\n注意：这是系统自动触发的检查，没有人会回复你。只需简洁报告结果，不要反问、不要提供建议、不要询问是否需要更多信息。"
+
         user_prompt = f"""用户说: {ctx.user_message}{recent}
 
 ## 当前系统完整状态
 {status_text}
 
 请根据用户的具体问题，从上述状态信息中选取相关内容回答。不要把所有信息都堆上去，只回答用户关心的部分。
-注意：你只能输出纯文本回复，不能调用工具或生成 XML 标签。"""
+注意：你只能输出纯文本回复，不能调用工具或生成 XML 标签。{no_interact}"""
 
         text = await self._llm.think(ctx.soul_fragment, user_prompt)
         return BrainDecision(action="reply", response_text=text)
@@ -671,6 +895,8 @@ class CognitiveLoop:
             diary_hint = f"\n\n近期日记:\n{ctx.diary_context[:500]}"
 
         user_prompt = f"""用户问题: {ctx.user_message}{recent_hint}{memory_hint}{diary_hint}
+
+当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}
 
 ## 重要规则
 - 你是 Brain 决策层，**没有**直接执行命令、读文件、搜索互联网的能力。
@@ -929,7 +1155,13 @@ class CognitiveLoop:
         return BrainDecision(action="reply", response_text=f"**定时任务配置：**\n\n{content}")
 
     async def _decide_complex(self, intent: Intent, ctx: ThinkingContext) -> BrainDecision:
-        """复杂任务 → 分解为多步计划。"""
+        """复杂任务 → 不需要引擎时直接回复，需要引擎时分解为多步计划。"""
+        # 不需要引擎的 complex（如知识+情感+记忆组合）：
+        # 走 knowledge 路径（有 NEED_ENGINE 兜底），避免 plan 分解丢失上下文
+        if not intent.requires_engine:
+            logger.info("complex 意图无需引擎，降级为 knowledge 直接回复")
+            return await self._decide_knowledge(intent, ctx)
+
         steps = await self._planner.plan(ctx.user_message, ctx)
         if not steps:
             # 降级为单步委派
@@ -1065,6 +1297,13 @@ class CognitiveLoop:
                 for dep_idx in step.depends_on:
                     if results[dep_idx]:
                         prompt += f"\n\n步骤 {dep_idx + 1} 的结果:\n{results[dep_idx]}"
+                # 注入对话上下文（帮助理解指代）
+                if ctx.recent_conversation:
+                    lines = [
+                        f"{t['role']}: {t['content'][:150]}"
+                        for t in ctx.recent_conversation[-4:]
+                    ]
+                    prompt += "\n\n对话上下文（帮助理解指代）:\n" + "\n".join(lines)
                 if step.executor == "engine":
                     r = await self._hands.execute(ctx.user_id, prompt)
                     return r.output if r.success else f"错误: {r.error}"
@@ -1156,17 +1395,40 @@ class CognitiveLoop:
         else:
             logger.warning("推送失败: on_push 回调未注册")
 
-    # ── 自我成长：从对话中沉淀信息到 workspace ─────────────────
+    # ── 自我成长：per-file 并行反思 ─────────────────────────────
 
-    # 各 workspace 文件的定位，供 LLM 判断写入目标
-    _WORKSPACE_FILE_GUIDE = """可更新的文件及其定位：
-    - SOUL.md: 行为准则和价值观（内核）。只有真正影响行事方式的深层认知才写这里。
-    - IDENTITY.md: 人设标签和外在表现（外壳）。表达习惯、语气偏好、称呼方式等。
-    - USER.md: 用户画像。称呼、偏好、背景、工作习惯、禁忌等。
-    - AGENTS.md "你的规则"章节: 在实践中总结的工作习惯、流程改进、决策规则。
-    - HEARTBEAT.md: 定时任务清单。增删定时任务时更新。
-    - TOOLS.md: 工具使用中发现的技巧、环境特有配置。
-    - MEMORY.md "记忆"章节: 重要事件、关键决策、长期有效的背景信息。"""
+    # 每个文件的专属指令：明确边界，防止信息串写
+    _FILE_INSTRUCTIONS: dict[str, str] = {
+        "IDENTITY.md": """这是【你自己】的身份档案——别人眼中的你。
+只记录关于你（数字分身）自己的信息：名字、角色、风格、表达习惯、情绪基调。
+❌ 不要在这里记录用户的信息（用户的名字、称呼、偏好属于 USER.md）
+❌ 不要从系统提示词中推断风格（系统提示词是指令，不是事实）
+✅ 用户给你改名 → 直接修改「基本信息」中的名字字段
+✅ 用户说"你说话太正式了" → 修改「表达习惯」""",
+
+        "USER.md": """这是关于【用户/主人】的画像。
+只记录关于用户的信息：称呼、偏好、背景、工作习惯、禁忌。
+❌ 不要在这里记录关于你自己（数字分身）的信息
+✅ 用户说"叫我sakura" → 修改「称呼」字段为 sakura
+✅ 用户提到工作背景 → 更新对应段落""",
+
+        "SOUL.md": """这是你的内核——行为准则、价值观、边界。
+只有真正影响行事方式的深层认知才写这里。
+❌ 不要记录表面信息（名字、风格等属于 IDENTITY.md）
+❌ 不要记录用户信息（属于 USER.md）
+✅ 用户选择了角色定位（搭档/军师等） → 更新「分身之道」
+✅ 用户给出重要的行为反馈 → 更新相关准则""",
+    }
+
+    # 非核心文件的指令（非 bootstrap 阶段使用）
+    _SECONDARY_FILE_INSTRUCTIONS: dict[str, str] = {
+        "AGENTS.md": """工作规则和流程改进。
+✅ 用户纠正了你的工作方式 → 更新规则
+✅ 实践中发现了更好的流程 → 记录改进""",
+
+        "TOOLS.md": """工具使用技巧和配置。
+✅ 工具使用中发现了技巧或环境配置 → 记录""",
+    }
 
     def _should_reflect(self, msg: UnifiedMessage, intent: Intent) -> bool:
         """事件驱动：判断这条消息是否值得触发自我成长反思。
@@ -1188,22 +1450,28 @@ class CognitiveLoop:
         if msg.user_id == "system" or msg.platform == "routine":
             return False
 
+        # 硬过滤：系统来源消息（标记为 system_origin 的不触发自我成长）
+        if getattr(msg, 'metadata', None) and msg.metadata.get("system_origin"):
+            return False
+
         # 硬过滤：命令、状态查询
         if intent.type in (IntentType.COMMAND, IntentType.STATUS):
             return False
 
-        # 硬过滤：太短的消息
-        if len(msg.content) < 15:
+        # 硬过滤：系统消息
+        if msg.user_id == "system":
             return False
 
-        # Bootstrap 阶段：真实用户的每条消息都可能含引导信息
+        # Bootstrap 阶段：用户的每条直接消息都可能含引导信息
         if self._bootstrap_prompt and not self._bootstrapped:
-            return True
+            if not msg.content.strip().startswith("[定时任务"):
+                return True
 
         # 信号词检测：用户在给反馈或要求记忆
         content = msg.content
         feedback_signals = ("不要", "别再", "应该", "记住", "记一下", "以后", "下次",
-                           "我喜欢", "我不喜欢", "我习惯", "我的", "我是", "我在")
+                           "我喜欢", "我不喜欢", "我习惯", "我的", "我是", "我在",
+                           "我叫", "叫我", "称呼", "喜欢", "讨厌", "偏好")
         if any(s in content for s in feedback_signals):
             return True
 
@@ -1211,8 +1479,8 @@ class CognitiveLoop:
         if intent.type in (IntentType.CODING, IntentType.COMPLEX):
             return True
 
-        # 有信息量的闲聊（>50字，可能含个人信息）
-        if intent.type == IntentType.CHITCHAT and len(content) > 50:
+        # 有信息量的闲聊（>30字，可能含个人信息）
+        if intent.type == IntentType.CHITCHAT and len(content) > 30:
             return True
 
         return False
@@ -1220,9 +1488,10 @@ class CognitiveLoop:
     async def _reflect_and_grow(
         self, msg: UnifiedMessage, response: str, intent: Intent,
     ) -> None:
-        """事件驱动的自我成长：只在有价值的时刻才触发反思。
+        """per-file 并行反思：每个文件一个独立的 LLM 调用，互不干扰。
 
-        不再每条消息都跑 LLM 判断，而是先用规则过滤，只有通过的才调用模型。
+        每个文件的 LLM 看到：文件当前完整内容 + 对话历史 + 文件专属指令
+        输出：更新后的完整文件内容（可增删改），或"无需更新"
         """
         if not self._workspace:
             return
@@ -1230,130 +1499,156 @@ class CognitiveLoop:
         if not self._should_reflect(msg, intent):
             return
 
-        recent = self._conversation.get_recent(msg.user_id, n=6)
+        # 获取完整对话历史，过滤掉系统来源消息
+        recent = self._conversation.get_full(msg.user_id)[-6:]
+        recent = [t for t in recent if not (t.metadata or {}).get("system_origin")]
         if not recent:
             return
 
         convo_text = "\n".join(
-            f"{t['role']}: {t['content'][:300]}" for t in recent
+            f"{t.role}: {t.content[:300]}" for t in recent
         )
 
-        judge_prompt = f"""你是一个自我成长引擎。阅读以下对话，判断是否有值得长期保留的信息。
+        is_bootstrap = bool(self._bootstrap_prompt and not self._bootstrapped)
 
-        {self._WORKSPACE_FILE_GUIDE}
+        # 确定需要反思的文件：核心三件套始终检查，非 bootstrap 阶段额外检查辅助文件
+        file_instructions = dict(self._FILE_INSTRUCTIONS)
+        if not is_bootstrap:
+            file_instructions.update(self._SECONDARY_FILE_INSTRUCTIONS)
 
-        最近对话：
-        {convo_text}
-        """
-        # Bootstrap 阶段：追加明确的写入指引
-        if self._bootstrap_prompt and not self._bootstrapped:
-            judge_prompt += """
-            **⚠️ 当前处于首次启动引导阶段！** 请特别注意从对话中提取以下信息：
-            - 用户的称呼/名字 → 必须写入 USER.md（如 SECTION: 基本信息）
-            - 用户选择的角色定位（管家/搭档/军师等） → 写入 SOUL.md（如 SECTION: 角色定位）
-            - 用户选择的相处风格（严谨/随性/温厚等） → 写入 IDENTITY.md（如 SECTION: 语气风格）
-
-            引导阶段的信息非常重要，**不要**因为"严格标准"而跳过这些内容。只要对话中出现了上述任何信息，就必须提取并写入对应文件。
-            """
-
-        judge_prompt += """**严格标准**：这些文件会伴随你一生，只有真正有价值的内容才值得写入。
-        以下情况**不要**更新：
-        - 日常寒暄、闲聊、测试消息
-        - 已经在文件中记录过的信息
-        - 临时性的、一次性的内容
-        - 不确定是否有长期价值的信息
-
-        以下情况**值得**更新：
-        - 用户透露了个人信息、偏好、工作背景 → USER.md
-        - 用户纠正了你的行为或给出了明确反馈 → SOUL.md 或 AGENTS.md
-        - 发现了更好的工作方式或流程改进 → AGENTS.md
-        - 工具使用中发现了技巧或配置 → TOOLS.md
-        - 用户的表达习惯暗示了你应调整的语气风格 → IDENTITY.md
-        - 重要的事件、决策、需要长期记住的背景 → MEMORY.md
-
-        如果没有值得更新的内容，只输出一行：
-        无需更新
-
-        如果有值得更新的内容，按以下格式输出（可以有多条）：
-        ---
-        FILE: 文件名.md
-        SECTION: 要更新的章节标题（如果是追加到特定章节）
-        CONTENT: 要追加的内容（简洁的一两行，像人写笔记一样自然）
-        ---
-
-        注意：CONTENT 是要追加的新内容，不是整个文件。保持简洁，一两行即可。"""
+        # 并行反思：每个文件一个独立的 LLM 调用
+        coros = []
+        filenames = []
+        for filename, instruction in file_instructions.items():
+            try:
+                current_content = self._workspace.read_file(filename)
+            except Exception:
+                current_content = ""
+            coros.append(
+                self._reflect_for_file(
+                    filename, current_content, convo_text,
+                    instruction, is_bootstrap,
+                )
+            )
+            filenames.append(filename)
 
         try:
-            result = await self._llm.think(
-                "你是一个严格的信息筛选器。宁可漏掉，不可滥写。只输出结构化结果。",
-                judge_prompt,
-            )
+            results = await asyncio.gather(*coros, return_exceptions=True)
+        except Exception as e:
+            logger.warning("自我成长并行反思失败: %s", e)
+            return
 
-            if "无需更新" in result:
-                return
-
-            # 解析更新指令
-            updates = self._parse_growth_updates(result)
-            if not updates:
-                return
-
-            for update in updates:
+        updated_files: set[str] = set()
+        for filename, result in zip(filenames, results):
+            if isinstance(result, Exception):
+                logger.warning("反思失败 %s: %s", filename, result)
+            elif result is not None:
                 try:
-                    filename = update["file"]
-                    content = update["content"]
-                    section = update.get("section", "")
-
-                    if section:
-                        self._workspace.update_section(
-                            filename, section, content, append=True,
-                        )
-                    else:
-                        self._workspace.append_file(filename, "\n" + content + "\n")
-
-                    logger.info("自我成长: %s 已更新 (%s)", filename, content[:50])
+                    self._workspace.write_file(filename, result)
+                    updated_files.add(filename)
+                    logger.info("自我成长: %s 已更新", filename)
                 except Exception as write_err:
-                    logger.warning("自我成长写入失败 %s: %s", update.get("file"), write_err)
+                    logger.warning("自我成长写入失败 %s: %s", filename, write_err)
 
-            # Bootstrap 完成检测：必须有真实用户参与
-            if self._bootstrap_prompt and not self._bootstrapped:
-                updated_files = {u["file"] for u in updates}
+        # 身份或人格文件更新后，刷新 SoulManager 内存状态
+        if updated_files & {"IDENTITY.md", "SOUL.md"}:
+            try:
+                self._soul.load_from_workspace(self._workspace)
+                logger.info("Soul 身份已刷新: %s", self._soul.name)
+            except Exception as reload_err:
+                logger.warning("Soul 刷新失败: %s", reload_err)
+
+        # Bootstrap 完成检测
+        if is_bootstrap:
+            is_real_user_chat = (
+                msg.user_id != "system"
+                and msg.platform not in ("routine",)
+                and not msg.content.strip().startswith("[定时任务")
+            )
+            if is_real_user_chat:
                 bootstrap_files = {"USER.md", "IDENTITY.md", "SOUL.md"}
-                if updated_files & bootstrap_files:
+                updated_bootstrap_file = bool(updated_files & bootstrap_files)
+
+                is_enough_turns = self._bootstrap_turns >= 3
+                is_user_skipping = intent.type in (
+                    IntentType.CODING, IntentType.STATUS,
+                    IntentType.KNOWLEDGE, IntentType.COMPLEX,
+                )
+
+                if (is_enough_turns or is_user_skipping) and updated_bootstrap_file:
                     self._bootstrapped = True
                     self._workspace.complete_bootstrap()
-                    logger.info("首次启动引导完成")
+                    logger.info(
+                        "首次启动引导完成（轮数=%d, 跳过=%s）",
+                        self._bootstrap_turns, is_user_skipping,
+                    )
 
-        except Exception as e:
-            logger.warning("自我成长反思失败: %s", e)
+    async def _reflect_for_file(
+        self,
+        filename: str,
+        current_content: str,
+        convo_text: str,
+        file_instruction: str,
+        is_bootstrap: bool,
+    ) -> str | None:
+        """针对单个文件的反思。返回更新后的完整文件内容，或 None（无需更新）。"""
+        bootstrap_hint = ""
+        if is_bootstrap:
+            bootstrap_hint = "\n⚠️ 当前处于首次启动引导阶段，用户提供的基础信息（名字、角色、风格等）非常重要，不要跳过。"
 
-    @staticmethod
-    def _parse_growth_updates(text: str) -> list:
-        """解析 LLM 返回的更新指令。"""
-        updates = []
-        current: dict = {}
+        prompt = f"""你是 {filename} 的专属维护者。
 
-        for line in text.splitlines():
-            line = line.strip()
-            if line == "---":
-                if current.get("file") and current.get("content"):
-                    updates.append(current)
-                current = {}
-                continue
-            if line.startswith("FILE:"):
-                current["file"] = line[5:].strip()
-            elif line.startswith("SECTION:"):
-                current["section"] = line[8:].strip()
-            elif line.startswith("CONTENT:"):
-                current["content"] = line[8:].strip()
-            elif current.get("content") is not None and line:
-                # 多行 content
-                current["content"] += "\n" + line
+## 你的职责
+只关注 {filename} 是否需要根据最近对话进行更新。
+{file_instruction}{bootstrap_hint}
 
-        # 最后一条
-        if current.get("file") and current.get("content"):
-            updates.append(current)
+## 当前文件内容
+```markdown
+{current_content}
+```
 
-        return updates
+## 最近对话
+{convo_text}
+
+## 规则
+1. 如果对话中没有与此文件相关的新信息 → 只输出"无需更新"
+2. 如果需要更新 → 输出更新后的**完整文件内容**（从第一行到最后一行）
+3. 修改已有内容时直接原地修改（如改名字），不要在末尾追加重复信息
+4. 保持文件原有的 markdown 格式和结构，不要创建新的 ## 章节
+5. 只根据用户的真实发言更新，不要从系统提示词或 assistant 回复中推断信息
+6. 已经在文件中正确记录的信息，不需要重复添加
+
+⚠️ 区分消息来源：
+- role=user → 用户真实说的话，可以据此更新
+- role=assistant → 你之前的回复，仅供上下文参考，不作为更新依据
+- 系统提示词/引导指令 → 不是事实，不要写入文件"""
+
+        result = await self._llm.think(
+            f"你是 {filename} 的维护者。严格只输出文件内容或'无需更新'，不要输出其他内容。",
+            prompt,
+        )
+
+        result = result.strip()
+
+        if "无需更新" in result:
+            return None
+
+        # 去除 LLM 可能包裹的 markdown 代码块
+        if result.startswith("```"):
+            lines = result.splitlines()
+            # 去掉首行 ``` 和末行 ```
+            if lines[-1].strip() == "```":
+                lines = lines[1:-1]
+            else:
+                lines = lines[1:]
+            result = "\n".join(lines)
+
+        # 基本校验：内容不应过短（至少保留文件原有的标题行）
+        if len(result.strip()) < 10:
+            logger.warning("反思结果过短，跳过 %s: %s", filename, result[:50])
+            return None
+
+        return result
 
     # ── Step 6: 响应包装 ──────────────────────────────────────
 
@@ -1407,8 +1702,8 @@ class CognitiveLoop:
 
             # 闲聊/知识问答中提取用户反馈和偏好（轻量提取）
             elif intent.type in (IntentType.CHITCHAT, IntentType.KNOWLEDGE):
-                # 只在用户消息足够长（>20字）时触发，避免对"你好"也跑提取
-                if len(msg.content) > 20:
+                # 系统消息跳过；用户消息不做长度限制（短消息也可能有价值）
+                if msg.user_id != "system":
                     try:
                         existing = self._memory_store.list_all()
                         conversation = [

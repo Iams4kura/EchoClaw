@@ -18,6 +18,7 @@ class Turn:
     content: str
     timestamp: float = field(default_factory=time.time)
     intent_type: Optional[str] = None  # 记录该轮的意图类型
+    metadata: Optional[Dict] = None  # 额外元数据（如 system_origin 标记）
 
 
 class ConversationStore:
@@ -44,11 +45,12 @@ class ConversationStore:
         role: str,
         content: str,
         intent_type: Optional[str] = None,
+        metadata: Optional[Dict] = None,
     ) -> None:
         """记录一轮对话。超出上限时丢弃最早的记录。"""
         key = self._key(user_id)
         turns = self._conversations[key]
-        turns.append(Turn(role=role, content=content, intent_type=intent_type))
+        turns.append(Turn(role=role, content=content, intent_type=intent_type, metadata=metadata))
         if len(turns) > self._max_history:
             self._conversations[key] = turns[-self._max_history :]
 

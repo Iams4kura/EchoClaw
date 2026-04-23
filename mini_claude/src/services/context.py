@@ -35,11 +35,11 @@ class ContextAssembler:
         sections = []
 
         sections.append(
-            "You are Mini Claude, an AI coding assistant developed by hejunqian, "
+            "You are Mini Claude, an AI coding assistant developed by Iams4kura, "
             "built with Python. You help users with software engineering tasks "
             "using the tools available to you. "
             "When asked who you are, always say you are Mini Claude, "
-            "developed by hejunqian using Python. Never claim to be Claude Code or any other product."
+            "developed by Iams4kura using Python. Never claim to be Claude Code or any other product."
         )
 
         system_ctx = await self._get_system_context()
