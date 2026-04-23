@@ -132,7 +132,6 @@ async def async_main(config_path: Optional[str] = None) -> None:
     async def routine_trigger(msg: UnifiedMessage) -> None:
         """Routine 触发回调：送入 Brain 认知循环，结果推送到前端。"""
         response = await cognitive.process(msg)
-        logger.info("Routine 结果 [%s]: %s", msg.chat_id, response.text[:200])
 
         # 系统内部任务：用模型判断是否有真实异常
         is_system = msg.chat_id.startswith("routine_sys_")
@@ -175,6 +174,7 @@ async def async_main(config_path: Optional[str] = None) -> None:
                 return
 
         # 推送到 webhook 前端
+        logger.info("Routine 推送 [%s]: %s", msg.chat_id, response.text[:200])
         target = msg.user_id if msg.user_id != "system" else "default"
         webhook.push_notification(target, response.text, source=msg.chat_id)
         routine_scheduler.record_interaction()
@@ -358,12 +358,16 @@ async def async_main(config_path: Optional[str] = None) -> None:
                 soul_ctx += "\n\n--- 首次启动引导 ---\n" + workspace.load_bootstrap()
             else:
                 # 日常启动：给人设 + 最近日记，让问候有内容
+                from datetime import datetime as _dt
+
+                now_str = _dt.now().strftime("%Y-%m-%d %H:%M")
                 diary = workspace.list_recent_diaries(days=1)
                 if diary and diary.strip():
                     diary_hint = f"\n\n近期日记：\n{diary[:500]}"
                     user_prompt = (
-                        "你刚刚醒来了，主动打个招呼。"
+                        f"当前时间：{now_str}。你刚刚醒来了，主动打个招呼。"
                         "可以结合下面的日记内容寻找一个话题。"
+                        "注意日记条目带有日期标注，请根据日期准确描述时间。"
                         "只引用日记中实际存在的内容，不要编造。"
                         f"{diary_hint}"
                     )

@@ -314,16 +314,34 @@ class WebhookAdapter:
 
         @self.app.post("/api/routines/{routine_id}/trigger")
         async def trigger_routine(routine_id: str, request: MessageRequest) -> dict[str, Any]:
-            """手动触发心跳任务：根据 routine_id 查找任务内容，发送给引擎执行。"""
+            """手动触发心跳任务：构造与定时调度相同的 UnifiedMessage，走 routine 通道。"""
             routines = await list_routines()
             routine = next((r for r in routines if r["id"] == routine_id), None)
             if not routine:
                 return {"ok": False, "error": "任务不存在"}
-            # 将任务内容作为消息发送给引擎
-            prompt = f"[定时任务手动触发] {routine['name']}：{routine['content']}"
+
+            from datetime import datetime as _dt
+
+            now = _dt.now().strftime("%Y-%m-%d %H:%M")
+            prompt = (
+                f"[心跳任务·手动触发] {routine['name']}\n"
+                f"当前时间: {now}\n\n"
+                f"任务内容:\n{routine['content']}\n\n"
+                "直接用工具完成并输出结果。"
+            )
+
             try:
-                result = await self._process_message(request.user_id, prompt)
-                # 推送结果通知给用户（不加前缀，直接发内容）
+                if hasattr(self._handler, "process"):
+                    msg = UnifiedMessage(
+                        platform="routine",
+                        user_id="system",
+                        chat_id=f"heartbeat_{routine['name']}",
+                        content=prompt,
+                    )
+                    response = await self._handler.process(msg)
+                    result = response.text
+                else:
+                    result = await self._process_message(request.user_id, prompt)
                 self.push_notification(request.user_id, result, source="routine")
                 return {"ok": True, "message": "已触发并执行完成"}
             except Exception as e:

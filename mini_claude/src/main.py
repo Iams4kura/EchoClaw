@@ -58,6 +58,12 @@ def register_all_tools(registry: ToolRegistry, state: Optional[AppState] = None)
         pass
 
     try:
+        from .tools.web_fetch import WebFetchTool
+        registry.register(WebFetchTool(), aliases=["fetch", "curl", "http"])
+    except (ImportError, Exception):
+        pass
+
+    try:
         from .tools.web_search import WebSearchTool
         from .tools.knowledge import SourceRegistry
         from .tools.knowledge.sources import WebSource, NewsSource, TechDocsSource

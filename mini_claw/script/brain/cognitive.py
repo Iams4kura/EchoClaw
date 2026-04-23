@@ -134,6 +134,8 @@ class CognitiveLoop:
         self._self_healer = self_healer
         self._composer = ResponseComposer(llm, soul)
         self._planner = TaskPlanner(llm)
+        self._last_greeting: str = ""
+        self._last_user_message_time: Optional[datetime] = None
 
         # 外部回调：长任务时先发确认消息
         self._on_ack: Optional[Callable[[str, str], Awaitable[None]]] = None
@@ -324,6 +326,10 @@ class CognitiveLoop:
         # 情绪 tick：空闲恢复 + 跨天重置
         self._soul.soul.mood.tick()
 
+        # 记录用户真实消息时间（非系统/定时任务）
+        if msg.user_id != "system" and msg.platform != "routine":
+            self._last_user_message_time = datetime.now()
+
         # 1. 构建思考上下文
         state.update_thinking(1, "build_context", "running", "构建上下文...")
         ctx = self._build_context(msg)
@@ -369,14 +375,14 @@ class CognitiveLoop:
         state.check_cancelled()
 
         # 6. 响应包装
-        state.update_thinking(6, "compose", "running", "组织回复...")
-        response = await self._compose_response(raw_result, intent, ctx)
-        # 最终防线：清洗响应中的伪工具调用标签
-        response = self._sanitize_response(response)
-        state.update_thinking(6, "compose", "done", "回复就绪")
-
-        # 7. 同步记录对话历史（系统/routine 消息不污染用户会话上下文）
         is_internal = msg.user_id == "system" or msg.platform == "routine"
+        state.update_thinking(6, "compose", "running", "组织回复...")
+        if is_internal and decision.action == "delegate":
+            response = self._sanitize_response(raw_result)
+        else:
+            response = await self._compose_response(raw_result, intent, ctx)
+            response = self._sanitize_response(response)
+        state.update_thinking(6, "compose", "done", "回复就绪")
         if not is_internal:
             self._conversation.add(msg.user_id, "user", msg.content, intent.type.value, getattr(msg, 'metadata', None))
             self._conversation.add(msg.user_id, "assistant", response, metadata=None)
@@ -614,7 +620,20 @@ class CognitiveLoop:
             case IntentType.KNOWLEDGE:
                 return await self._decide_knowledge(intent, ctx)
             case IntentType.COMMAND:
-                return await self._decide_command(ctx)
+                # 快速路径：以 / 开头的才是真正的系统命令
+                if ctx.user_message.strip().startswith("/"):
+                    return await self._decide_command(ctx)
+                # 不以 / 开头的"command"是自然语言表达的执行请求
+                # 视为 coding 任务委派给引擎（如"试试执行xx""排查原因"等）
+                return self._decide_delegate(
+                    Intent(
+                        type=IntentType.CODING,
+                        confidence=0.9,
+                        summary=ctx.user_message[:50],
+                        requires_engine=True,
+                    ),
+                    ctx,
+                )
             case IntentType.COMPLEX:
                 return await self._decide_complex(intent, ctx)
             case IntentType.MEMORY:
@@ -677,6 +696,17 @@ class CognitiveLoop:
     async def _decide_proactive_greeting(self, ctx: ThinkingContext) -> BrainDecision:
         """系统主动发起的问候，使用更高温度产生更有创意的回复。"""
 
+        # 获取当前时间用于问候判断
+        from datetime import datetime
+        now = datetime.now()
+        hour = now.hour
+        if 5 <= hour < 12:
+            time_desc = "早上"
+        elif 12 <= hour < 18:
+            time_desc = "下午"
+        else:
+            time_desc = "晚上"
+
         memory_hint = ""
         if ctx.relevant_memories:
             lines = [f"- {m.name}: {m.content[:100]}" for m in ctx.relevant_memories[:3]]
@@ -684,7 +714,11 @@ class CognitiveLoop:
 
         diary_hint = ""
         if ctx.diary_context and ctx.diary_context.strip():
-            diary_hint = f"\n\n你有近期日记可参考：\n{ctx.diary_context[:500]}"
+            diary_hint = (
+                f"\n\n你有近期日记可参考（今天是 {now.strftime('%Y-%m-%d')}，"
+                f"请根据日记条目的日期准确描述时间）：\n"
+                f"{ctx.diary_context[:500]}"
+            )
 
         # 根据有无上下文数据，用不同的 prompt 策略
         has_context = bool(memory_hint or diary_hint)
@@ -702,16 +736,31 @@ class CognitiveLoop:
                 "不要编造任何之前的工作内容、项目或对话。"
             )
 
-        # 获取当前时间用于问候判断
-        from datetime import datetime
-        now = datetime.now()
-        hour = now.hour
-        if 5 <= hour < 12:
-            time_desc = "早上"
-        elif 12 <= hour < 18:
-            time_desc = "下午"
-        else:
-            time_desc = "晚上"
+        # 注入上次问候内容，避免重复
+        repeat_hint = ""
+        if self._last_greeting:
+            repeat_hint = (
+                f"\n- 你上次的问候是：「{self._last_greeting[:150]}」"
+                "——这次必须换一个完全不同的话题和开场方式，不要重复。"
+            )
+
+        # 注入用户沉默时长，让问候更有情感
+        idle_hint = ""
+        if self._last_user_message_time:
+            idle_minutes = (now - self._last_user_message_time).total_seconds() / 60
+            idle_hours = idle_minutes / 60
+            if idle_hours >= 12:
+                idle_hint = (
+                    f"\n- 主人已经 {idle_hours:.0f} 小时没有回复你了（上次回复: "
+                    f"{self._last_user_message_time.strftime('%H:%M')}），"
+                    "你可以在问候中自然地流露出一点被冷落的小情绪或撒娇抱怨。"
+                )
+            elif idle_hours >= 6:
+                idle_hint = (
+                    f"\n- 主人已经 {idle_hours:.1f} 小时没有回复你了（上次回复: "
+                    f"{self._last_user_message_time.strftime('%H:%M')}），"
+                    "可以稍微提一下，语气自然就好。"
+                )
 
         user_prompt = f"""主动问候时间。
 
@@ -722,14 +771,16 @@ class CognitiveLoop:
 注意：
 - 这不是用户在回复你，是你要主动发起对话。
 - 绝对不要编造不存在的日记内容、项目名称或工作进展。如果没有数据就不要提。
+{repeat_hint}
+{idle_hint}
 
 请直接输出你要说的话，不要解释你在做什么。"""
 
-        # 主动问候使用固定温度 0.7，更有创意
+        # 主动问候使用较高温度，更有创意且避免雷同
         text = await self._llm.chat(
             system=ctx.soul_fragment,
             user=user_prompt,
-            temperature=0.7,
+            temperature=0.9,
             max_tokens=512,
         )
 
@@ -738,6 +789,7 @@ class CognitiveLoop:
             logger.info("主动问候检测到幻觉工具调用，使用备用消息")
             text = "嗨，我在这儿呢，有什么想聊聊的吗？"
 
+        self._last_greeting = text
         return BrainDecision(action="reply", response_text=text)
 
     async def _decide_status(self, ctx: ThinkingContext) -> BrainDecision:

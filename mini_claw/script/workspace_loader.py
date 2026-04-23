@@ -381,7 +381,7 @@ class WorkspaceLoader:
             d = (today - timedelta(days=i)).isoformat()
             content = self._read(self._diary_filename(d))
             if content:
-                parts.append(content.strip())
+                parts.append(f"[{d}]\n{content.strip()}")
         return "\n\n---\n\n".join(parts)
 
     # ── 会话日志（memory/sessions/YYYY-MM-DD.jsonl） ─────────────
