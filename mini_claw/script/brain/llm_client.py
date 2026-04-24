@@ -86,6 +86,7 @@ class BrainLLMClient:
         user: str,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
     ) -> str:
         """单次对话调用，支持覆盖温度参数。
 
@@ -101,6 +102,7 @@ class BrainLLMClient:
                 messages=messages,
                 temperature=temperature if temperature is not None else self._config.temperature,
                 max_tokens=max_tokens if max_tokens is not None else self._config.max_tokens,
+                top_p=top_p,
             )
             return self._extract_text(response)
         except Exception as e:

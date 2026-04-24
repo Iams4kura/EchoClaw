@@ -1,7 +1,9 @@
 """Mini Claw 主入口 — WorkspaceLoader 驱动 Soul → Brain → Hands 认知架构。"""
 
 import asyncio
+import json
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -129,8 +131,11 @@ async def async_main(config_path: Optional[str] = None) -> None:
 
     logger.info("Brain cognitive loop ready")
 
-    async def routine_trigger(msg: UnifiedMessage) -> None:
-        """Routine 触发回调：送入 Brain 认知循环，结果推送到前端。"""
+    async def routine_trigger(msg: UnifiedMessage) -> bool:
+        """Routine 触发回调：送入 Brain 认知循环，结果推送到前端。
+
+        返回 True 表示任务真正执行了，False 表示跳过。
+        """
         response = await cognitive.process(msg)
 
         # 系统内部任务：用模型判断是否有真实异常
@@ -148,7 +153,7 @@ async def async_main(config_path: Optional[str] = None) -> None:
                 logger.info("系统检查判断: anomaly=%s, reason=%s",
                             has_anomaly, judgment.get("reason", ""))
                 if not has_anomaly:
-                    return
+                    return True
                 # 有异常：先尝试自愈
                 logger.warning("系统检查发现异常，尝试自愈: %s", judgment.get("reason"))
                 heal_result = await self_healer.heal_simple(
@@ -158,26 +163,40 @@ async def async_main(config_path: Optional[str] = None) -> None:
                 )
                 if heal_result and heal_result.fix_ok:
                     logger.info("系统异常已自愈: %s", judgment.get("reason"))
-                    return
+                    return True
                 # 自愈失败才通知用户
                 logger.warning("系统异常自愈失败，通知用户")
             except Exception as e:
                 logger.error("系统检查判断失败: %s，默认不通知", e)
-                return
+                return True
 
-        # 心跳任务：如果结果是"跳过/无更新"类的，不推送给用户
+        # 心跳任务：解析模型输出的结构化标记
         is_heartbeat = msg.chat_id.startswith("heartbeat_")
         if is_heartbeat:
-            skip_keywords = ("跳过", "无更新", "不执行", "无需", "没有更新", "没有新")
-            if any(kw in response.text for kw in skip_keywords):
-                logger.info("心跳结果无需推送 [%s]: %s", msg.chat_id, response.text[:100])
-                return
+            executed, meta_updates, clean_text = _parse_heartbeat_result(response.text)
+            if not executed:
+                logger.info("心跳结果无需推送 [%s]: %s", msg.chat_id, clean_text[:100])
+                return False
 
-        # 推送到 webhook 前端
+            # 推送给用户（去掉标记行）
+            logger.info("Routine 推送 [%s]: %s", msg.chat_id, clean_text[:200])
+            target = msg.user_id if msg.user_id != "system" else "default"
+            webhook.push_notification(target, clean_text, source=msg.chat_id)
+            routine_scheduler.record_interaction()
+
+            if meta_updates:
+                task_name = msg.chat_id[len("heartbeat_"):]
+                routine_scheduler.update_task_meta(task_name, meta_updates)
+                logger.info("更新心跳任务 meta [%s]: %s", task_name, meta_updates)
+
+            return True
+
+        # 其他 routine 任务：直接推送
         logger.info("Routine 推送 [%s]: %s", msg.chat_id, response.text[:200])
         target = msg.user_id if msg.user_id != "system" else "default"
         webhook.push_notification(target, response.text, source=msg.chat_id)
         routine_scheduler.record_interaction()
+        return True
 
     routine_scheduler._on_trigger = routine_trigger
     if config.routine.enabled:
@@ -236,6 +255,7 @@ async def async_main(config_path: Optional[str] = None) -> None:
 
     # Webhook（始终启动：/health + /message + 聊天页面）
     webhook = WebhookAdapter(cognitive)
+    webhook._routine_scheduler = routine_scheduler
 
     # 访问日志中间件
     from starlette.middleware.base import BaseHTTPMiddleware
@@ -394,6 +414,24 @@ async def async_main(config_path: Optional[str] = None) -> None:
         for adapter in adapters_to_stop:
             await adapter.stop()
         logger.info("Mini Claw stopped")
+
+
+def _parse_heartbeat_result(text: str) -> tuple:
+    """解析心跳任务回复中的结构化标记。
+
+    返回 (executed: bool, meta: dict, clean_text: str)。
+    """
+    import re
+    match = re.search(r"<!--heartbeat_result:\s*(\{.*?\})\s*-->", text, re.DOTALL)
+    if match:
+        clean_text = text[:match.start()].rstrip()
+        try:
+            data = json.loads(match.group(1))
+            return data.get("executed", True), data.get("meta") or {}, clean_text
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    # 无标记时默认视为已执行（兼容）
+    return True, {}, text
 
 
 def cli() -> None:

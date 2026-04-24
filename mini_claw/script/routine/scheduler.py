@@ -89,6 +89,25 @@ class RoutineScheduler:
         # 持久化到心跳状态文件
         self._save_heartbeat_state()
 
+    def update_task_meta(self, task_name: str, meta_updates: Dict[str, Any]) -> None:
+        """更新心跳任务的 meta 并持久化。"""
+        for t in self._heartbeat_tasks:
+            if t.name == task_name:
+                t.meta.update(meta_updates)
+                if task_name in self._heartbeat_log:
+                    self._heartbeat_log[task_name]["meta"] = t.meta
+                self._save_heartbeat_state()
+                return
+
+    async def trigger_task_by_name(self, name: str) -> Optional[str]:
+        """手动触发指定心跳任务，返回结果文本，未找到返回 None。"""
+        for task in self._heartbeat_tasks:
+            if task.name == name:
+                now = datetime.now().strftime("%Y-%m-%d %H:%M")
+                await self._trigger_heartbeat(task, now)
+                return task.name
+        return None
+
     def load_from_config(self, config_data: List[Dict[str, Any]]) -> None:
         """从配置数据加载自定义任务。"""
         for item in config_data:
@@ -339,7 +358,13 @@ class RoutineScheduler:
             f"\n任务内容:\n{task.prompt}\n\n"
             "请自主判断现在是否需要执行此任务。\n"
             "如果需要执行，直接用工具完成并输出结果。\n"
-            "如果不需要执行，简短说明原因即可（如「无更新」「已执行过」）。"
+            "如果不需要执行，简短说明原因即可。\n\n"
+            "【重要】无论是否执行，你必须在回复的最末尾附加一行 JSON 标记（独占一行），格式如下：\n"
+            '<!--heartbeat_result:{"executed": true/false, "meta": {...}}-->\n'
+            "- executed: 布尔值，true 表示你确实执行了任务并产出了结果，false 表示判断后不需要执行。\n"
+            "- meta: 可选对象，用于持久化任务状态到下次执行。例如新闻推送任务可以记录 "
+            '{"last_pushed_guid": "最新的URL"} 等。不需要更新 meta 时传空对象 {} 即可。\n'
+            "这行标记不会展示给用户，仅供系统解析。请确保 JSON 合法。"
         )
 
         msg = UnifiedMessage(
@@ -350,9 +375,14 @@ class RoutineScheduler:
         )
 
         try:
-            await self._on_trigger(msg)
+            executed = await self._on_trigger(msg)
         except Exception as e:
             logger.error("心跳任务执行失败 %s: %s", task.name, e)
+            return
+
+        # 只有真正执行的任务才更新时间和状态
+        if not executed:
+            return
 
         # 更新执行记录
         self._heartbeat_log[task.name] = {

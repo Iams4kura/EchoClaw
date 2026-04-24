@@ -64,6 +64,7 @@ class BaseLLMBackend(ABC):
         model: str = None,
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        top_p: Optional[float] = None,
     ) -> LLMResponse:
         """Non-streaming completion."""
         pass
@@ -99,6 +100,7 @@ class AnthropicBackend(BaseLLMBackend):
         model: str = "claude-3-5-sonnet-20241022",
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        top_p: Optional[float] = None,
     ) -> LLMResponse:
         """Complete with Anthropic API."""
         api_messages = [msg.to_api_format() for msg in messages if msg.role != "system"]
@@ -113,6 +115,8 @@ class AnthropicBackend(BaseLLMBackend):
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+        if top_p is not None:
+            kwargs["top_p"] = top_p
         if system_prompt:
             kwargs["system"] = system_prompt
         if tools:
@@ -211,6 +215,7 @@ class LiteLLMBackend(BaseLLMBackend):
         model: str = "anthropic/claude-3-5-sonnet-20241022",
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        top_p: Optional[float] = None,
     ) -> LLMResponse:
         """Complete via LiteLLM."""
         api_messages = [msg.to_api_format() for msg in messages if msg.role != "system"]
@@ -225,6 +230,8 @@ class LiteLLMBackend(BaseLLMBackend):
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+        if top_p is not None:
+            kwargs["top_p"] = top_p
         if system_prompt:
             # LiteLLM accepts system as first message or separate param
             api_messages.insert(0, {"role": "system", "content": system_prompt})
@@ -367,6 +374,7 @@ class OpenAICompatibleBackend(BaseLLMBackend):
         model: str = "gpt-3.5-turbo",
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        top_p: Optional[float] = None,
     ) -> LLMResponse:
         """Complete via OpenAI-compatible endpoint."""
         api_messages = self._build_messages(messages)
@@ -377,6 +385,8 @@ class OpenAICompatibleBackend(BaseLLMBackend):
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+        if top_p is not None:
+            body["top_p"] = top_p
         if tools:
             body["tools"] = self._convert_tools(tools)
 
@@ -726,6 +736,7 @@ class LLMClient:
         model: Optional[str] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
     ) -> LLMResponse:
         """Execute completion with error-classified retry."""
         model = model or self.config.model
@@ -739,6 +750,7 @@ class LLMClient:
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
+            top_p=top_p,
         )
 
     async def complete_streaming(
