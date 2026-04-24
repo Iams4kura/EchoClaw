@@ -25,7 +25,7 @@ from ..memory.store import MemoryStore
 from ..recovery.self_healer import SelfHealer
 from ..soul.manager import SoulManager
 from .composer import ResponseComposer
-from .conversation import ConversationStore
+from .conversation import ConversationStore, Turn
 from .llm_client import BrainLLMClient
 from .models import BrainDecision, Intent, IntentType, PlanStep, ThinkingContext
 from .planner import TaskPlanner
@@ -129,6 +129,8 @@ class CognitiveLoop:
         self._bootstrap_prompt = bootstrap_prompt
         self._bootstrapped = False
         self._bootstrap_turns = 0  # 引导阶段用户消息轮数计数
+        self._user_msg_counter = 0  # 累积式反思：真实用户消息计数
+        self._accumulated_user_turns: list[Turn] = []  # 累积的用户消息
         self._diary_context = diary_context
         self._personal_mode = personal_mode
         self._self_healer = self_healer
@@ -176,6 +178,19 @@ class CognitiveLoop:
         ):
             self._bootstrap_turns += 1
             logger.debug("引导轮数: %d", self._bootstrap_turns)
+
+        # 累积式反思：统计真实用户消息轮数（bootstrap 后生效）
+        is_real_user = (
+            msg.user_id != "system"
+            and msg.platform != "routine"
+            and not msg.content.strip().startswith("[定时任务")
+            and not (getattr(msg, 'metadata', None) and msg.metadata.get("system_origin"))
+        )
+        if is_real_user and self._bootstrapped:
+            self._user_msg_counter += 1
+            self._accumulated_user_turns.append(Turn(
+                role="user", content=msg.content, timestamp=msg.timestamp,
+            ))
 
         # /btw 打断：取消当前处理并重新提交组合消息
         if msg.content.strip().startswith("/btw "):
@@ -780,7 +795,8 @@ class CognitiveLoop:
         text = await self._llm.chat(
             system=ctx.soul_fragment,
             user=user_prompt,
-            temperature=0.9,
+            temperature=0.7,
+            top_p=0.8,
             max_tokens=512,
         )
 
@@ -1483,6 +1499,10 @@ class CognitiveLoop:
         if intent.type == IntentType.CHITCHAT and len(content) > 30:
             return True
 
+        # 累积式反思：每 10 轮真实用户消息强制触发
+        if self._user_msg_counter >= 10:
+            return True
+
         return False
 
     async def _reflect_and_grow(
@@ -1499,15 +1519,25 @@ class CognitiveLoop:
         if not self._should_reflect(msg, intent):
             return
 
-        # 获取完整对话历史，过滤掉系统来源消息
-        recent = self._conversation.get_full(msg.user_id)[-6:]
-        recent = [t for t in recent if not (t.metadata or {}).get("system_origin")]
-        if not recent:
-            return
-
-        convo_text = "\n".join(
-            f"{t.role}: {t.content[:300]}" for t in recent
-        )
+        # 累积式触发：使用纯用户消息，不含 assistant 回复和系统消息
+        is_accumulated = self._user_msg_counter >= 10
+        if is_accumulated:
+            recent_turns = self._accumulated_user_turns[-10:]
+            convo_text = "\n".join(
+                f"user: {t.content[:300]}" for t in recent_turns
+            )
+            self._user_msg_counter = 0
+            self._accumulated_user_turns.clear()
+            logger.info("累积式反思触发（10轮用户消息）")
+        else:
+            # 原有逻辑：取最近 6 轮完整对话，过滤系统消息
+            recent = self._conversation.get_full(msg.user_id)[-6:]
+            recent = [t for t in recent if not (t.metadata or {}).get("system_origin")]
+            if not recent:
+                return
+            convo_text = "\n".join(
+                f"{t.role}: {t.content[:300]}" for t in recent
+            )
 
         is_bootstrap = bool(self._bootstrap_prompt and not self._bootstrapped)
 
