@@ -182,7 +182,7 @@ mini_claw --config /path/to/settings.yaml
 | 模块 | 说明 |
 |------|------|
 | **Soul** 🎭 | 人格系统，从 `workspace/IDENTITY.md` 和 `SOUL.md` 加载性格与行为准则 |
-| **Brain** 🧠 | 认知循环，意图识别 → 计划 → 执行 → 反思，支持多轮对话 |
+| **Brain** 🧠 | 认知循环，意图识别 → 计划 → 执行 → 反思，支持多轮对话压缩、会话边界检测与记忆回忆 |
 | **Hands** 🤲 | 执行层，调用 mini_claude 引擎池完成编码、文件操作等任务 |
 | **Memory** 💾 | 记忆系统，自动提取对话要点，持久化到 `workspace/memory/` |
 | **Gateway** 🌐 | 网关层，统一消息协议，适配 Telegram / 飞书 / 企微 / Webhook |
