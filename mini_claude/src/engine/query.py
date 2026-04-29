@@ -4,6 +4,8 @@ Reference: src/query.ts, src/QueryEngine.ts
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 from typing import Optional, List, Callable, Awaitable
 
@@ -22,8 +24,13 @@ logger = logging.getLogger(__name__)
 # Maximum consecutive tool-use turns before forcing a text response
 MAX_TOOL_TURNS = 25
 
-# Maximum calls to the same tool in one turn (prevents retry-storm)
-MAX_SAME_TOOL_CALLS = 3
+# Maximum consecutive failures with identical input before blocking (prevents retry-storm)
+MAX_SAME_TOOL_RETRIES = 3
+
+
+def _tool_input_hash(tool_input: dict) -> str:
+    raw = json.dumps(tool_input, sort_keys=True, ensure_ascii=False)
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
 class QueryEngine:
@@ -85,7 +92,8 @@ class QueryEngine:
             self.state.messages = await self.compactor.compact(self.state.messages)
 
         tool_turn_count = 0
-        tool_call_counts: dict[str, int] = {}  # 每个工具本轮调用次数
+        # key=tool_name, value=(last_input_hash, consecutive_fail_count)
+        tool_fail_tracker: dict[str, tuple[str, int]] = {}
         final_text = ""
 
         while tool_turn_count < MAX_TOOL_TURNS:
@@ -171,23 +179,22 @@ class QueryEngine:
             if not tool_uses:
                 break
 
-            # 7.5 Enforce per-tool call limits & preprocess inputs
+            # 7.5 Enforce retry-storm limits & preprocess inputs
             capped_uses = []
             capped_results: dict[str, ToolResult] = {}
             for tu in tool_uses:
-                count = tool_call_counts.get(tu.name, 0)
-                if count >= MAX_SAME_TOOL_CALLS:
+                input_hash = _tool_input_hash(tu.input)
+                last_hash, fail_count = tool_fail_tracker.get(tu.name, ("", 0))
+                if last_hash == input_hash and fail_count >= MAX_SAME_TOOL_RETRIES:
                     capped_results[tu.id] = ToolResult(
                         content=(
-                            f"Tool '{tu.name}' already called {count} times this turn. "
-                            f"Limit is {MAX_SAME_TOOL_CALLS}. "
-                            "Summarize what you have and respond to the user."
+                            f"Tool '{tu.name}' failed {fail_count} consecutive times "
+                            f"with the same input. Limit is {MAX_SAME_TOOL_RETRIES}. "
+                            "Try a different approach or respond to the user."
                         ),
                         is_error=True,
                     )
                 else:
-                    tool_call_counts[tu.name] = count + 1
-                    # 短查询自动扩展（仅 WebSearch）
                     self._maybe_expand_search_query(tu)
                     capped_uses.append(tu)
 
@@ -195,6 +202,18 @@ class QueryEngine:
             tool_results = await self._execute_tools_with_permissions(
                 tool_uses, capped_uses, capped_results,
             )
+
+            # 8.5 Update fail tracker based on results
+            for tu, result in zip(tool_uses, tool_results):
+                input_hash = _tool_input_hash(tu.input)
+                if result["is_error"]:
+                    last_hash, count = tool_fail_tracker.get(tu.name, ("", 0))
+                    if last_hash == input_hash:
+                        tool_fail_tracker[tu.name] = (input_hash, count + 1)
+                    else:
+                        tool_fail_tracker[tu.name] = (input_hash, 1)
+                else:
+                    tool_fail_tracker[tu.name] = ("", 0)
 
             # 9. Add tool results as user message (Anthropic format)
             result_blocks = []

@@ -40,6 +40,10 @@ class TaskPlanner:
             lines = [f"{t['role']}: {t['content'][:150]}" for t in ctx.recent_conversation[-4:]]
             conversation_context = "最近对话（帮助理解指代）:\n" + "\n".join(lines)
 
+        workspace_rules = ""
+        if ctx.agents_rules:
+            workspace_rules = f"\n## workspace 文件规则\n{ctx.agents_rules}\n"
+
         system_prompt = f"""{ctx.soul_fragment}
 
 你是一个任务规划助手。将复杂任务分解为有序的执行步骤。"""
@@ -52,13 +56,14 @@ class TaskPlanner:
 {conversation_context}
 
 {memory_context}
-
+{workspace_rules}
 ## 规则
 1. 每个步骤应该是原子性的、可独立执行的
 2. executor 标记为 "brain"（思考/回复）或 "engine"（需要 mini_claude 执行代码/文件操作）
 3. prompt 是该步骤实际执行时的指令
 4. 如果某步骤依赖前面步骤的结果，在 depends_on 中标注步骤索引（从 0 开始）
 5. 步骤数量控制在 2-6 步
+6. 涉及 workspace 文件操作时，engine 的 prompt 中必须明确写入目标文件路径和格式要求（如追加到已有文件而非创建新文件）
 
 返回 JSON 数组：
 ```json

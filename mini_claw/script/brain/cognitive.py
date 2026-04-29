@@ -123,14 +123,29 @@ class CognitiveLoop:
         self._memory_loader = memory_loader
         self._memory_extractor = memory_extractor
         self._conversation = conversation or ConversationStore()
+        self._conversation.set_compress_fn(self._llm.summarize_conversation)
+        self._conversation.set_topic_check_fn(self._llm.check_topic_relevance)
         self._state_provider = state_provider
         self._workspace = workspace
         self._agents_rules = agents_rules
         self._bootstrap_prompt = bootstrap_prompt
-        self._bootstrapped = False
+        self._bootstrapped = not bootstrap_prompt
         self._bootstrap_turns = 0  # 引导阶段用户消息轮数计数
         self._user_msg_counter = 0  # 累积式反思：真实用户消息计数
         self._accumulated_user_turns: list[Turn] = []  # 累积的用户消息
+        # 从 workspace 恢复累积反思状态
+        if workspace:
+            try:
+                counter, turns = workspace.load_reflection_state()
+                self._user_msg_counter = counter
+                self._accumulated_user_turns = [
+                    Turn(role="user", content=t["content"], timestamp=t.get("timestamp", 0))
+                    for t in turns
+                ]
+                if counter > 0:
+                    logger.info("恢复累积反思状态: counter=%d, turns=%d", counter, len(turns))
+            except Exception as e:
+                logger.warning("恢复累积反思状态失败: %s", e)
         self._diary_context = diary_context
         self._personal_mode = personal_mode
         self._self_healer = self_healer
@@ -345,9 +360,20 @@ class CognitiveLoop:
         if msg.user_id != "system" and msg.platform != "routine":
             self._last_user_message_time = datetime.now()
 
+        # 会话边界检测：间隔 > 1h 且话题不相关时开启新会话
+        if msg.platform == "webhook" and msg.user_id != "system":
+            try:
+                session_cleared = await self._conversation.check_session_boundary(
+                    msg.user_id, msg.content
+                )
+                if session_cleared:
+                    logger.info("会话边界检测触发，用户 %s 开启新会话", msg.user_id)
+            except Exception as e:
+                logger.warning("会话边界检测异常: %s", e)
+
         # 1. 构建思考上下文
         state.update_thinking(1, "build_context", "running", "构建上下文...")
-        ctx = self._build_context(msg)
+        ctx = await self._build_context(msg)
         state.update_thinking(1, "build_context", "done", "上下文就绪")
         state.check_cancelled()
 
@@ -399,8 +425,17 @@ class CognitiveLoop:
             response = self._sanitize_response(response)
         state.update_thinking(6, "compose", "done", "回复就绪")
         if not is_internal:
-            self._conversation.add(msg.user_id, "user", msg.content, intent.type.value, getattr(msg, 'metadata', None))
-            self._conversation.add(msg.user_id, "assistant", response, metadata=None)
+            self._conversation.add(
+                msg.user_id, "user", msg.content,
+                intent_type=intent.type.value,
+                metadata=getattr(msg, 'metadata', None),
+                platform=msg.platform,
+            )
+            self._conversation.add(
+                msg.user_id, "assistant", response,
+                metadata=None,
+                platform=msg.platform,
+            )
 
         # 后处理（异步，不阻塞响应：情绪更新、记忆提取等）
         state.update_thinking(7, "post_process", "running", "后处理中...")
@@ -449,7 +484,7 @@ class CognitiveLoop:
             return "__owner__"
         return user_id
 
-    def _build_context(self, msg: UnifiedMessage) -> ThinkingContext:
+    async def _build_context(self, msg: UnifiedMessage) -> ThinkingContext:
         """组装 Brain 思考所需的全部上下文。"""
         soul_fragment = self._soul.get_system_prompt_fragment()
 
@@ -481,6 +516,12 @@ class CognitiveLoop:
                     diary_context = self._diary_context  # fallback 到启动时的缓存
             recent_conv = self._conversation.get_recent(query_user)
 
+        # 构建压缩后的多轮消息列表
+        try:
+            conversation_messages = await self._conversation.get_compressed_messages(query_user)
+        except Exception:
+            conversation_messages = recent_conv
+
         return ThinkingContext(
             user_message=msg.content,
             user_id=msg.user_id,
@@ -489,6 +530,7 @@ class CognitiveLoop:
             soul_fragment=soul_fragment,
             mood_context=self._soul.get_mood_context(),
             recent_conversation=recent_conv,
+            conversation_messages=conversation_messages,
             system_state=self._state_provider() if self._state_provider else {},
             agents_rules=self._agents_rules,
             diary_context=diary_context,
@@ -652,7 +694,7 @@ class CognitiveLoop:
             case IntentType.COMPLEX:
                 return await self._decide_complex(intent, ctx)
             case IntentType.MEMORY:
-                return self._decide_memory(ctx)
+                return await self._decide_memory(ctx)
             case _:
                 return self._decide_delegate(intent, ctx)
 
@@ -677,29 +719,24 @@ class CognitiveLoop:
                 logger.info("低置信度 chitchat (%.2f) 涉及文件/系统查询，转委派", intent.confidence)
                 return self._decide_delegate(intent, ctx)
 
-        memory_hint = ""
+        system_parts = [ctx.soul_fragment]
         if ctx.relevant_memories:
             lines = [f"- {m.name}: {m.content[:100]}" for m in ctx.relevant_memories[:3]]
-            memory_hint = "\n\n相关记忆（可参考但不必都提及）:\n" + "\n".join(lines)
-
-        recent = ""
-        if ctx.recent_conversation:
-            lines = [f"{t['role']}: {t['content'][:150]}" for t in ctx.recent_conversation[-4:]]
-            recent = "\n\n最近对话:\n" + "\n".join(lines)
-
-        diary_hint = ""
+            system_parts.append("\n\n相关记忆（可参考但不必都提及）:\n" + "\n".join(lines))
         if ctx.diary_context:
-            diary_hint = f"\n\n近期日记（你的工作记录，可参考）:\n{ctx.diary_context[:500]}"
+            system_parts.append(f"\n\n近期日记（你的工作记录，可参考）:\n{ctx.diary_context[:500]}")
+        system_parts.append(f"\n\n当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        system_parts.append(
+            "\n\n请自然地回复。注意：\n"
+            "- 你只能输出纯文本，不能调用工具、生成 XML 标签或 tool_code。\n"
+            "- 系统提示中的状态描述和行为指令是给你参考的内部信息，不要直接转述给用户。"
+        )
 
-        user_prompt = f"""用户说: {ctx.user_message}{recent}{memory_hint}{diary_hint}
-
-当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}
-
-请自然地回复。注意：
-- 你只能输出纯文本，不能调用工具、生成 XML 标签或 tool_code。如果用户的请求需要执行操作（如搜索、编码），请告诉用户你会帮他处理，但不要模拟工具调用。
-- 系统提示中的状态描述和行为指令是给你参考的内部信息，不要直接转述给用户。用自己的话自然表达。"""
-
-        text = await self._llm.think(ctx.soul_fragment, user_prompt)
+        text = await self._llm.think_multi_turn(
+            system_prompt="\n".join(system_parts),
+            conversation=ctx.conversation_messages,
+            user_message=ctx.user_message,
+        )
 
         # 检测幻觉：LLM 在闲聊中模拟工具调用 → 转为委派引擎执行
         if self._looks_like_hallucinated_action(text):
@@ -875,8 +912,8 @@ class CognitiveLoop:
         parts = [ctx.user_message]
 
         # 注入对话历史（让引擎理解指代："那个文件""刚才的内容"等）
-        if ctx.recent_conversation:
-            lines = [f"{t['role']}: {t['content'][:150]}" for t in ctx.recent_conversation[-4:]]
+        if ctx.conversation_messages:
+            lines = [f"{t['role']}: {t['content'][:150]}" for t in ctx.conversation_messages[-8:]]
             parts.append("对话上下文（帮助理解指代）:\n" + "\n".join(lines))
 
         # 注入相关记忆上下文
@@ -895,33 +932,26 @@ class CognitiveLoop:
 
     async def _decide_knowledge(self, intent: Intent, ctx: ThinkingContext) -> BrainDecision:
         """知识问答 → 先尝试 Brain 直接回答，不确定则委派引擎。"""
-        # 对话历史（让模型理解指代和上下文）
-        recent_hint = ""
-        if ctx.recent_conversation:
-            lines = [f"{t['role']}: {t['content'][:150]}" for t in ctx.recent_conversation[-4:]]
-            recent_hint = "\n\n最近对话:\n" + "\n".join(lines)
-
-        memory_hint = ""
+        system_parts = [ctx.soul_fragment]
         if ctx.relevant_memories:
             lines = [f"- {m.name}: {m.content[:200]}" for m in ctx.relevant_memories[:3]]
-            memory_hint = "\n\n参考记忆:\n" + "\n".join(lines)
-
-        diary_hint = ""
+            system_parts.append("\n\n参考记忆:\n" + "\n".join(lines))
         if ctx.diary_context:
-            diary_hint = f"\n\n近期日记:\n{ctx.diary_context[:500]}"
+            system_parts.append(f"\n\n近期日记:\n{ctx.diary_context[:500]}")
+        system_parts.append(f"\n\n当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        system_parts.append(
+            "\n\n## 重要规则\n"
+            "- 你是 Brain 决策层，**没有**直接执行命令、读文件、搜索互联网的能力。\n"
+            "- 如果问题需要查看代码、读取文件、执行命令、搜索网络，回复 \"NEED_ENGINE\"。\n"
+            "- 只有凭自身知识就能确信回答时，才直接回答。\n"
+            "- 注意结合对话历史理解用户的指代。"
+        )
 
-        user_prompt = f"""用户问题: {ctx.user_message}{recent_hint}{memory_hint}{diary_hint}
-
-当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}
-
-## 重要规则
-- 你是 Brain 决策层，**没有**直接执行命令、读文件、搜索互联网的能力。
-- 如果问题需要查看代码、读取文件、执行命令、搜索网络、或查看系统状态，你**必须**回复 "NEED_ENGINE"，由底层引擎代为执行。
-- 只有当你凭自身知识就能确信回答时，才直接回答（纯文本，不要生成 XML 标签或模拟命令执行）。
-- 不要编造命令输出或假装你执行了某个操作。
-- 注意结合最近对话理解用户的指代（如"那个文件""刚才的内容"等）。"""
-
-        text = await self._llm.think(ctx.soul_fragment, user_prompt)
+        text = await self._llm.think_multi_turn(
+            system_prompt="\n".join(system_parts),
+            conversation=ctx.conversation_messages,
+            user_message=ctx.user_message,
+        )
 
         # 检测是否需要引擎，或 LLM 虽没说 NEED_ENGINE 但在模拟执行
         if "NEED_ENGINE" in text or self._looks_like_hallucinated_action(text):
@@ -985,6 +1015,9 @@ class CognitiveLoop:
         cmd = parts[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
         match cmd:
+            case "/clear":
+                self._conversation.clear(ctx.user_id)
+                return BrainDecision(action="reply", response_text="会话历史已清空。")
             case "/reset":
                 return BrainDecision(
                     action="reply",
@@ -1184,8 +1217,8 @@ class CognitiveLoop:
             return self._decide_delegate(intent, ctx)
         return BrainDecision(action="plan", plan=steps)
 
-    def _decide_memory(self, ctx: ThinkingContext) -> BrainDecision:
-        """记忆操作 → 操作记忆存储。"""
+    async def _decide_memory(self, ctx: ThinkingContext) -> BrainDecision:
+        """记忆操作 → 操作记忆存储 / 回忆对话。"""
         msg = ctx.user_message.lower()
         if "记住" in msg or "remember" in msg:
             return BrainDecision(
@@ -1199,6 +1232,17 @@ class CognitiveLoop:
                 memory_ops=[{"op": "forget", "content": ctx.user_message, "user_id": ctx.user_id}],
                 response_text="好的，我会忘记这个。",
             )
+
+        # 检测回忆/回顾类查询 → 用 LLM 基于对话历史和日记回答
+        recall_keywords = (
+            "说了什么", "聊了什么", "对话", "总结", "回忆", "回顾",
+            "上次", "之前", "昨天", "刚才", "刚刚", "今天聊",
+            "talked about", "what did", "summarize", "yesterday",
+            "earlier", "just said", "last time", "conversation",
+        )
+        if any(kw in msg for kw in recall_keywords):
+            return await self._decide_memory_recall(ctx)
+
         # 默认：列出记忆
         memories = self._memory_store.list_all()
         if memories:
@@ -1206,6 +1250,55 @@ class CognitiveLoop:
             text = "我记得这些:\n" + "\n".join(lines)
         else:
             text = "目前没有存储任何记忆。"
+        return BrainDecision(action="reply", response_text=text)
+
+    async def _decide_memory_recall(self, ctx: ThinkingContext) -> BrainDecision:
+        """基于对话历史和日记回答回忆类问题。"""
+        # 当前会话的近期对话
+        recent = ""
+        conv = ctx.conversation_messages or ctx.recent_conversation
+        if conv:
+            lines = [f"{t['role']}: {t['content'][:200]}" for t in conv[-10:]]
+            recent = "\n\n当前会话的最近对话:\n" + "\n".join(lines)
+
+        # 日记上下文（最近2天）
+        diary_hint = ""
+        if ctx.diary_context:
+            diary_hint = f"\n\n近期日记:\n{ctx.diary_context[:1500]}"
+
+        # 尝试加载昨天的会话日志
+        session_hint = ""
+        if self._workspace:
+            from datetime import timedelta
+            from datetime import date as _date
+            yesterday = (_date.today() - timedelta(days=1)).isoformat()
+            today = _date.today().isoformat()
+            logs = []
+            for d in [yesterday, today]:
+                records = self._workspace.read_session_logs(dt=d, limit=15)
+                for r in records:
+                    user_msg = r.get("user_message", "")
+                    reply = r.get("reply", r.get("response", ""))
+                    if user_msg:
+                        logs.append(f"[{d}] 用户: {user_msg[:150]}")
+                    if reply:
+                        logs.append(f"[{d}] 我: {reply[:150]}")
+            if logs:
+                session_hint = "\n\n会话记录:\n" + "\n".join(logs[-30:])
+
+        memory_hint = ""
+        if ctx.relevant_memories:
+            lines = [f"- {m.name}: {m.content[:100]}" for m in ctx.relevant_memories[:3]]
+            memory_hint = "\n\n相关记忆:\n" + "\n".join(lines)
+
+        user_prompt = f"""用户说: {ctx.user_message}{recent}{session_hint}{diary_hint}{memory_hint}
+
+当前时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+用户在问关于之前对话或记忆的问题。请根据上面提供的对话记录、会话日志和日记内容来回答。
+如果确实没有相关记录，诚实地说明。不要编造不存在的对话内容。"""
+
+        text = await self._llm.think(ctx.soul_fragment, user_prompt)
         return BrainDecision(action="reply", response_text=text)
 
     # ── Step 5: 执行 ──────────────────────────────────────────
@@ -1314,10 +1407,11 @@ class CognitiveLoop:
                     if results[dep_idx]:
                         prompt += f"\n\n步骤 {dep_idx + 1} 的结果:\n{results[dep_idx]}"
                 # 注入对话上下文（帮助理解指代）
-                if ctx.recent_conversation:
+                conv = ctx.conversation_messages or ctx.recent_conversation
+                if conv:
                     lines = [
                         f"{t['role']}: {t['content'][:150]}"
-                        for t in ctx.recent_conversation[-4:]
+                        for t in conv[-8:]
                     ]
                     prompt += "\n\n对话上下文（帮助理解指代）:\n" + "\n".join(lines)
                 if step.executor == "engine":
@@ -1411,6 +1505,19 @@ class CognitiveLoop:
         else:
             logger.warning("推送失败: on_push 回调未注册")
 
+    def _save_reflection_state(self) -> None:
+        """持久化累积反思计数器和消息。"""
+        if not self._workspace:
+            return
+        try:
+            turns = [
+                {"content": t.content, "timestamp": t.timestamp}
+                for t in self._accumulated_user_turns
+            ]
+            self._workspace.save_reflection_state(self._user_msg_counter, turns)
+        except Exception as e:
+            logger.warning("累积反思状态持久化失败: %s", e)
+
     # ── 自我成长：per-file 并行反思 ─────────────────────────────
 
     # 每个文件的专属指令：明确边界，防止信息串写
@@ -1499,6 +1606,10 @@ class CognitiveLoop:
         if intent.type == IntentType.CHITCHAT and len(content) > 30:
             return True
 
+        # 知识问答可能透露用户兴趣/偏好/使用习惯
+        if intent.type == IntentType.KNOWLEDGE and len(content) > 10:
+            return True
+
         # 累积式反思：每 10 轮真实用户消息强制触发
         if self._user_msg_counter >= 10:
             return True
@@ -1528,6 +1639,7 @@ class CognitiveLoop:
             )
             self._user_msg_counter = 0
             self._accumulated_user_turns.clear()
+            self._save_reflection_state()
             logger.info("累积式反思触发（10轮用户消息）")
         else:
             # 原有逻辑：取最近 6 轮完整对话，过滤系统消息
@@ -1768,6 +1880,9 @@ class CognitiveLoop:
                     self._workspace.save_mood(self._soul.soul.mood)
                 except Exception as mood_err:
                     logger.warning("情绪持久化失败: %s", mood_err)
+
+            # 持久化累积反思状态
+            self._save_reflection_state()
 
             # 会话日志：记录完整的用户-模型交互
             if self._workspace:

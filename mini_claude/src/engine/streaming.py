@@ -4,6 +4,8 @@ Reference: src/query.ts streaming logic
 """
 
 import asyncio
+import hashlib
+import json
 from typing import Optional, Callable, Awaitable, List, Union
 
 from ..models.message import Message, TextBlock, ThinkingBlock, ToolUseBlock, ToolResultBlock
@@ -16,6 +18,12 @@ from ..tools.registry import ToolRegistry
 from ..tools.orchestration import ToolOrchestrator
 
 MAX_TOOL_TURNS = 25
+MAX_SAME_TOOL_RETRIES = 3
+
+
+def _tool_input_hash(tool_input: dict) -> str:
+    raw = json.dumps(tool_input, sort_keys=True, ensure_ascii=False)
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
 class StreamHandler:
@@ -64,6 +72,7 @@ class StreamHandler:
             self.state.messages = await self.compactor.compact(self.state.messages)
 
         tool_turn_count = 0
+        tool_fail_tracker: dict[str, tuple[str, int]] = {}
         final_text = ""
 
         while tool_turn_count < MAX_TOOL_TURNS:
@@ -128,8 +137,48 @@ class StreamHandler:
             if not collected_tool_uses:
                 break
 
-            # Execute tools with permissions and parallel orchestration
-            tool_results = await self._execute_tools_with_permissions(collected_tool_uses)
+            # Enforce retry-storm limits
+            capped_results: dict[str, ToolResult] = {}
+            executable_uses = []
+            for tu in collected_tool_uses:
+                input_hash = _tool_input_hash(tu.input)
+                last_hash, fail_count = tool_fail_tracker.get(tu.name, ("", 0))
+                if last_hash == input_hash and fail_count >= MAX_SAME_TOOL_RETRIES:
+                    capped_results[tu.id] = ToolResult(
+                        content=(
+                            f"Tool '{tu.name}' failed {fail_count} consecutive times "
+                            f"with the same input. Limit is {MAX_SAME_TOOL_RETRIES}. "
+                            "Try a different approach or respond to the user."
+                        ),
+                        is_error=True,
+                    )
+                else:
+                    executable_uses.append(tu)
+
+            # Execute non-capped tools
+            exec_results = await self._execute_tools_with_permissions(executable_uses)
+
+            # Merge results in original order
+            exec_iter = iter(exec_results)
+            tool_results = []
+            for tu in collected_tool_uses:
+                if tu.id in capped_results:
+                    r = capped_results[tu.id]
+                    tool_results.append({"content": r.content, "is_error": r.is_error})
+                else:
+                    tool_results.append(next(exec_iter))
+
+            # Update fail tracker
+            for tu, result in zip(collected_tool_uses, tool_results):
+                input_hash = _tool_input_hash(tu.input)
+                if result["is_error"]:
+                    last_hash, count = tool_fail_tracker.get(tu.name, ("", 0))
+                    if last_hash == input_hash:
+                        tool_fail_tracker[tu.name] = (input_hash, count + 1)
+                    else:
+                        tool_fail_tracker[tu.name] = (input_hash, 1)
+                else:
+                    tool_fail_tracker[tu.name] = ("", 0)
 
             result_blocks = []
             for tool_use, result in zip(collected_tool_uses, tool_results):
