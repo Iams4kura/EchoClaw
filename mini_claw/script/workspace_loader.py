@@ -239,6 +239,30 @@ class WorkspaceLoader:
         except (json.JSONDecodeError, KeyError):
             return MoodState()
 
+    # ── 累积反思状态持久化 ──────────────────────────────────────
+
+    def save_reflection_state(self, counter: int, turns: list) -> None:
+        """持久化累积反思计数器和消息到 .openclaw/reflection_state.json。"""
+        data = {
+            "user_msg_counter": counter,
+            "accumulated_turns": turns,
+        }
+        self._write(
+            ".openclaw/reflection_state.json",
+            json.dumps(data, indent=2, ensure_ascii=False),
+        )
+
+    def load_reflection_state(self) -> tuple:
+        """恢复累积反思状态。返回 (counter, turns_list)。"""
+        content = self._read(".openclaw/reflection_state.json")
+        if not content:
+            return 0, []
+        try:
+            data = json.loads(content)
+            return data.get("user_msg_counter", 0), data.get("accumulated_turns", [])
+        except (json.JSONDecodeError, KeyError):
+            return 0, []
+
     # ── USER.md 更新 ─────────────────────────────────────────
 
     def update_user(self, info: Dict[str, str]) -> None:
@@ -397,6 +421,25 @@ class WorkspaceLoader:
         existing = self._read(filename)
         line = json.dumps(record, ensure_ascii=False) + "\n"
         self._write(filename, existing + line)
+
+    def read_session_logs(self, dt: str = "", limit: int = 30) -> List[dict]:
+        """读取指定日期的会话日志，返回最近 limit 条记录。"""
+        import json as _json
+
+        d = dt or date.today().isoformat()
+        content = self._read(f"memory/sessions/{d}.jsonl")
+        if not content:
+            return []
+        records = []
+        for line in content.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(_json.loads(line))
+            except _json.JSONDecodeError:
+                continue
+        return records[-limit:]
 
     # ── Learnings 系统（memory/learnings/） ──────────────────────
 

@@ -75,6 +75,8 @@ class WebhookAdapter:
                 content=content,
             )
             response: BotResponse = await self._handler.process(msg)
+            if hasattr(self, "_routine_scheduler") and self._routine_scheduler:
+                self._routine_scheduler.record_interaction()
             return response.text
 
         # 旧版 SessionManager 兼容
@@ -112,6 +114,13 @@ class WebhookAdapter:
                 result = f"Engine error: {e}"
             duration_ms = (time.time() - t0) * 1000
             return MessageResponse(text=result, duration_ms=round(duration_ms, 1))
+
+        @self.app.post("/clear/{user_id}")
+        async def clear_conversation(user_id: str) -> dict[str, Any]:
+            if hasattr(self._handler, "_conversation"):
+                cleared = self._handler._conversation.clear(user_id)
+                return {"status": "cleared", "turns_cleared": len(cleared)}
+            return {"status": "no_store"}
 
         @self.app.post("/reset/{user_id}")
         async def reset_session(user_id: str) -> dict[str, Any]:
@@ -750,7 +759,8 @@ async function execCmd(cmd){
     addSystem("可用命令: "+CMDS.map(c=>c.name+" — "+c.desc).join("\\n"));
   }else if(cmd==="/clear"){
     chat.innerHTML="";try{localStorage.removeItem(storageKey())}catch(e){}
-    addSystem("聊天已清空（服务端会话仍保留）");
+    try{await fetch("/clear/"+encodeURIComponent(userId),{method:"POST"})}catch(e){console.warn("server clear failed",e)}
+    addSystem("聊天已清空");
   }else if(cmd==="/reset"){
     await resetSession();
   }else if(cmd==="/status"){

@@ -80,6 +80,60 @@ class BrainLLMClient:
             logger.error("Brain think 调用失败: %s", e)
             raise
 
+    async def think_multi_turn(
+        self,
+        system_prompt: str,
+        conversation: list[dict[str, str]],
+        user_message: str,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        """多轮对话调用：system + 历史消息列表 + 当前用户消息。"""
+        messages = []
+        messages.append(Message(
+            role="system",
+            content=(system_prompt or "") + self._NO_TOOL_CALL,
+        ))
+        for turn in conversation:
+            role, content = turn["role"], turn["content"]
+            if role == "system":
+                messages.append(Message(role="user", content=content))
+                messages.append(Message(role="assistant", content="好的，我了解了。"))
+            else:
+                messages.append(Message(role=role, content=content))
+        messages.append(Message(role="user", content=user_message))
+
+        try:
+            response = await self._llm.complete(
+                messages=messages,
+                temperature=temperature if temperature is not None else self._config.temperature,
+                max_tokens=max_tokens if max_tokens is not None else self._config.max_tokens,
+            )
+            return self._extract_text(response)
+        except Exception as e:
+            logger.error("Brain think_multi_turn 调用失败: %s", e)
+            raise
+
+    async def summarize_conversation(self, conversation_text: str) -> str:
+        """将一段对话压缩为简短摘要（供 ConversationStore 压缩用）。"""
+        system = (
+            "你是一个简洁的对话摘要助手。"
+            "请将以下对话总结为 2-4 句话，保留关键话题、决定和用户分享的重要信息。"
+            "只输出摘要，不要加前缀或解释。"
+        )
+        return await self.think(system, conversation_text)
+
+    async def check_topic_relevance(self, previous_context: str, new_message: str) -> bool:
+        """判断新消息是否与之前的对话主题相关（供会话边界检测用）。"""
+        system = (
+            "你是一个话题关联判断器。"
+            "给定之前的对话上下文和一条新消息，判断新消息是否是之前对话的延续或相关话题。"
+            "只回复一个词：RELATED 或 UNRELATED。"
+        )
+        user = f"之前的对话:\n{previous_context}\n\n新消息:\n{new_message}"
+        result = await self.think(system, user)
+        return "RELATED" in result.upper()
+
     async def chat(
         self,
         system: str,

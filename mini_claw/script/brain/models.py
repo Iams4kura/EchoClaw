@@ -47,6 +47,7 @@ class ThinkingContext:
     mood_context: str                 # 当前精力/心情描述
     relevant_memories: List[Any] = field(default_factory=list)  # MemoryEntry
     recent_conversation: List[Dict[str, str]] = field(default_factory=list)
+    conversation_messages: List[Dict[str, str]] = field(default_factory=list)
     system_state: Dict[str, Any] = field(default_factory=dict)
     agents_rules: str = ""                # AGENTS.md 中的工作流规则
     diary_context: str = ""               # 最近日记内容（启动时加载）

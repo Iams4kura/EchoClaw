@@ -13,6 +13,7 @@ from .config import load_config
 from .brain.cognitive import CognitiveLoop
 from .brain.conversation import ConversationStore
 from .brain.llm_client import BrainConfig, BrainLLMClient
+from src.config import load_config as load_mc_config, Config as MCConfig
 from .gateway.adapters.webhook import WebhookAdapter
 from .gateway.adapters.telegram import TelegramAdapter
 from .gateway.adapters.feishu import FeishuAdapter
@@ -67,12 +68,16 @@ async def async_main(config_path: Optional[str] = None) -> None:
     memory_loader = MemoryLoader(store=memory_store)
     memory_extractor = MemoryExtractor()
 
+    # 从 workspace 加载 AGENTS.md 规则（Hands 和 Brain 都需要）
+    agents_rules = workspace.load_agents()
+
     # ── Hands（执行层：mini_claude 引擎池） ──────────────────
     hands = HandsManager(
         working_dir=str(workspace.root),
         permission_mode=config.engine.permission_mode,
         model=config.engine.model,
         personal_mode=config.is_personal,
+        system_prompt_extra=agents_rules,
     )
 
     # ── Brain（认知循环） ────────────────────────────────────
@@ -85,12 +90,11 @@ async def async_main(config_path: Optional[str] = None) -> None:
         classify_temperature=config.brain.classify_temperature,
         classify_max_tokens=config.brain.classify_max_tokens,
     )
-    brain_llm = BrainLLMClient(brain_config)
+    # 加载 mini_claude 配置作为 Brain LLM 的 fallback
+    mc_config = load_mc_config()
+    brain_llm = BrainLLMClient(brain_config, fallback_mc_config=mc_config)
 
     conversation = ConversationStore(personal_mode=config.is_personal)
-
-    # 从 workspace 加载 AGENTS.md 规则 + BOOTSTRAP.md 引导 + 日记上下文
-    agents_rules = workspace.load_agents()
     bootstrap_prompt = workspace.load_bootstrap() if workspace.is_first_boot() else ""
     diary_context = workspace.list_recent_diaries(days=2)
 
@@ -182,7 +186,6 @@ async def async_main(config_path: Optional[str] = None) -> None:
             logger.info("Routine 推送 [%s]: %s", msg.chat_id, clean_text[:200])
             target = msg.user_id if msg.user_id != "system" else "default"
             webhook.push_notification(target, clean_text, source=msg.chat_id)
-            routine_scheduler.record_interaction()
 
             if meta_updates:
                 task_name = msg.chat_id[len("heartbeat_"):]
@@ -195,7 +198,6 @@ async def async_main(config_path: Optional[str] = None) -> None:
         logger.info("Routine 推送 [%s]: %s", msg.chat_id, response.text[:200])
         target = msg.user_id if msg.user_id != "system" else "default"
         webhook.push_notification(target, response.text, source=msg.chat_id)
-        routine_scheduler.record_interaction()
         return True
 
     routine_scheduler._on_trigger = routine_trigger
