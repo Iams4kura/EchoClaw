@@ -4,23 +4,26 @@ import logging
 import pathlib
 import time
 from collections import defaultdict, deque
-from typing import Any, Dict, List
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..models import BotResponse, UnifiedMessage
 
 logger = logging.getLogger(__name__)
 
+MAX_USER_ID_LENGTH = 128
+MAX_MESSAGE_LENGTH = 20_000
+
 
 class MessageRequest(BaseModel):
     """POST /message 请求体。"""
 
-    user_id: str = "default"
-    content: str
+    user_id: str = Field(default="default", min_length=1, max_length=MAX_USER_ID_LENGTH)
+    content: str = Field(min_length=1, max_length=MAX_MESSAGE_LENGTH)
 
 
 class MessageResponse(BaseModel):
@@ -42,8 +45,15 @@ class WebhookAdapter:
     v0.2: handler 可以是 Brain CognitiveLoop 或旧版 SessionManager。
     """
 
-    def __init__(self, handler: Any) -> None:
+    def __init__(
+        self,
+        handler: Any,
+        message_handler: Optional[
+            Callable[[UnifiedMessage], Awaitable[BotResponse]]
+        ] = None,
+    ) -> None:
         self._handler = handler
+        self._message_handler = message_handler
         self.app = FastAPI(title="Mini Claw API", version="0.3.0")
         self._start_time = time.time()
         # 推送消息队列（per-user，最多保留 50 条）
@@ -66,14 +76,21 @@ class WebhookAdapter:
 
     async def _process_message(self, user_id: str, content: str) -> str:
         """统一消息处理：优先 Brain CognitiveLoop，降级 SessionManager。"""
+        msg = UnifiedMessage(
+            platform="webhook",
+            user_id=user_id,
+            chat_id=user_id,
+            content=content,
+        )
+
+        # 生产入口通过统一中间件链处理，确保 Web 请求与 IM 平台拥有
+        # 相同的鉴权、限流和日志语义。
+        if self._message_handler is not None:
+            response = await self._message_handler(msg)
+            return response.text
+
         # Brain CognitiveLoop: 有 .process(UnifiedMessage) -> BotResponse
         if hasattr(self._handler, "process"):
-            msg = UnifiedMessage(
-                platform="webhook",
-                user_id=user_id,
-                chat_id=user_id,
-                content=content,
-            )
             response: BotResponse = await self._handler.process(msg)
             if hasattr(self, "_routine_scheduler") and self._routine_scheduler:
                 self._routine_scheduler.record_interaction()
@@ -111,7 +128,10 @@ class WebhookAdapter:
                 result = await self._process_message(request.user_id, request.content)
             except Exception as e:
                 logger.exception("Engine error for user %s", request.user_id)
-                result = f"Engine error: {e}"
+                raise HTTPException(
+                    status_code=500,
+                    detail="Message processing failed",
+                ) from e
             duration_ms = (time.time() - t0) * 1000
             return MessageResponse(text=result, duration_ms=round(duration_ms, 1))
 
