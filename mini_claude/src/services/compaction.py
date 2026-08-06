@@ -31,7 +31,7 @@ def count_tokens(text: str) -> int:
     """Count tokens using tiktoken if available, else rough estimate."""
     enc = _get_encoder()
     if enc is not None:
-        return len(enc.encode(text))
+        return max(1, len(enc.encode(text)))
     return len(text) // 4 + 1
 
 

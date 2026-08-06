@@ -78,4 +78,3 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-v --tb=short"
-collect_ignore_glob = ["*.pem", "tmp*", "pip-*", "venv*"]
