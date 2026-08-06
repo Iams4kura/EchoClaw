@@ -37,6 +37,9 @@ mclaw = "script.main:cli"
 where = ["."]
 include = ["script*"]
 
+[tool.setuptools.package-data]
+"script.avatar" = ["presets/*.yaml"]
+
 [tool.black]
 line-length = 100
 target-version = ['py310', 'py311', 'py312']
