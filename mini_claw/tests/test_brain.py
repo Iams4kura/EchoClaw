@@ -1,22 +1,17 @@
 """测试 Brain 认知循环。"""
 
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
+from unittest.mock import AsyncMock, MagicMock
 
 from script.brain.cognitive import CognitiveLoop
-from script.brain.conversation import ConversationStore, Turn
-from script.brain.llm_client import BrainConfig
+from script.brain.conversation import ConversationStore
 from script.brain.models import (
     BrainDecision,
     Intent,
     IntentType,
     PlanStep,
-    ThinkingContext,
 )
 from script.brain.planner import TaskPlanner
 from script.gateway.models import BotResponse, UnifiedMessage
-
 
 # ── 测试数据 ─────────────────────────────────────────────────
 
@@ -79,7 +74,16 @@ def _make_cognitive() -> CognitiveLoop:
 
 class TestIntentType:
     def test_all_types_exist(self) -> None:
-        expected = {"chitchat", "status", "coding", "file_ops", "knowledge", "command", "complex", "memory"}
+        expected = {
+            "chitchat",
+            "status",
+            "coding",
+            "file_ops",
+            "knowledge",
+            "command",
+            "complex",
+            "memory",
+        }
         actual = {t.value for t in IntentType}
         assert expected == actual
 
@@ -90,8 +94,14 @@ class TestIntentType:
 
 class TestIntent:
     def test_default_values(self) -> None:
-        intent = Intent(type=IntentType.CHITCHAT, confidence=0.9, summary="test")
+        intent = Intent(
+            type=IntentType.CHITCHAT,
+            confidence=0.9,
+            summary="test",
+            requires_engine=False,
+        )
         assert intent.requires_engine is False
+        assert intent.plan_steps == []
         assert intent.memory_keywords == []
 
     def test_coding_requires_engine(self) -> None:
