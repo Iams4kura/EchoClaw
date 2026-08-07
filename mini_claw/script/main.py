@@ -256,7 +256,7 @@ async def async_main(config_path: Optional[str] = None) -> None:
     # ── Gateway 适配器 ───────────────────────────────────────
 
     # Webhook（始终启动：/health + /message + 聊天页面）
-    webhook = WebhookAdapter(cognitive)
+    webhook = WebhookAdapter(cognitive, message_handler=middleware_chain)
     webhook._routine_scheduler = routine_scheduler
 
     # 访问日志中间件

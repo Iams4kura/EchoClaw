@@ -24,6 +24,7 @@ RUN pip install --no-cache-dir ./mini_claw/
 
 # 复制配置模板和预置分身
 COPY mini_claw/config/ mini_claw/config/
+COPY mini_claw/workspace/ mini_claw/workspace/
 
 # 创建运行时目录
 RUN mkdir -p mini_claw/data/memory mini_claw/logs /workspace

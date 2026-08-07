@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from script.engine_session import EngineSession, SessionManager
 from script.gateway.adapters.webhook import WebhookAdapter
+from script.gateway.models import BotResponse
 
 
 def _make_mock_session_manager() -> SessionManager:
@@ -73,6 +74,55 @@ class TestWebhookMessage:
         resp = client.post("/message", json={"content": "hello"})
         assert resp.status_code == 200
         mgr.get_or_create.assert_called_with("default")
+
+    def test_message_uses_middleware_handler(self) -> None:
+        mgr = _make_mock_session_manager()
+        middleware = AsyncMock(return_value=BotResponse(text="filtered response"))
+        adapter = WebhookAdapter(mgr, message_handler=middleware)
+        client = TestClient(adapter.app)
+
+        resp = client.post(
+            "/message", json={"user_id": "test_user", "content": "hello"}
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["text"] == "filtered response"
+        message = middleware.await_args.args[0]
+        assert message.platform == "webhook"
+        assert message.user_id == "test_user"
+        assert message.content == "hello"
+        mgr.get_or_create.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"content": ""},
+            {"content": "x" * 20_001},
+            {"user_id": "u" * 129, "content": "hello"},
+        ],
+    )
+    def test_message_rejects_invalid_input(self, payload: dict[str, str]) -> None:
+        adapter = WebhookAdapter(_make_mock_session_manager())
+        client = TestClient(adapter.app)
+
+        resp = client.post("/message", json=payload)
+
+        assert resp.status_code == 422
+
+    def test_message_does_not_leak_engine_errors(self) -> None:
+        mgr = _make_mock_session_manager()
+        session = mgr.get_or_create.return_value
+        session.handle = AsyncMock(
+            side_effect=RuntimeError("secret provider token")
+        )
+        adapter = WebhookAdapter(mgr)
+        client = TestClient(adapter.app, raise_server_exceptions=False)
+
+        resp = client.post("/message", json={"content": "hello"})
+
+        assert resp.status_code == 500
+        assert "secret provider token" not in resp.text
+        assert session.handle.await_count == 1
 
 
 class TestWebhookReset:

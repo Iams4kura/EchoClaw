@@ -136,8 +136,9 @@ mini_claw 是一个云端 AI 数字分身平台，拥有人格、记忆、自主
 #### 1. 安装
 
 ```bash
+# 在 EchoClaw 仓库根目录执行。mini_claw 运行时依赖 mini_claude 引擎。
+pip install -e ./mini_claude -e ./mini_claw
 cd mini_claw
-pip install -e .
 ```
 
 #### 2. 配置
@@ -314,13 +315,9 @@ EchoClaw/
 ### 运行测试
 
 ```bash
-# mini_claude 测试
-cd mini_claude
-pytest
-
-# mini_claw 测试
-cd mini_claw
-pytest
+# 在仓库根目录执行
+python -m pytest mini_claude/tests
+python -m pytest mini_claw/tests
 ```
 
 ### 构建 Web 控制台

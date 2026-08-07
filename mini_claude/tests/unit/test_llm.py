@@ -8,10 +8,6 @@ from src.models import Message, TextBlock, ToolUseBlock
 from src.config import Config
 
 
-# Skip real API tests by default
-pytestmark = pytest.mark.asyncio
-
-
 class TestLLMClientBasics:
     """Test LLMClient without real API calls."""
 
@@ -111,14 +107,28 @@ class TestLLMClientMock:
 class TestTokenEstimation:
     """Test token estimation utility."""
 
-    def test_estimate_tokens_rough(self):
-        """Rough 4:1 char to token ratio."""
+    def test_estimate_tokens_uses_available_tokenizer(self):
+        """Token estimates stay positive and grow with the input."""
         from src.services.llm import LLMClient
         with patch.object(LLMClient, '_init_backend'):
             client = LLMClient(Config())
             assert client.estimate_tokens("") == 1  # Minimum 1
-            assert client.estimate_tokens("aaaa") == 2  # 4 chars = 1 token + 1 min
-            assert client.estimate_tokens("a" * 40) == 11  # 40 chars = 10 + 1
+            short = client.estimate_tokens("aaaa")
+            long = client.estimate_tokens("a" * 40)
+            assert short >= 1
+            assert long > short
+
+    def test_estimate_tokens_fallback(self):
+        """The no-tiktoken fallback keeps the documented 4:1 estimate."""
+        from src.services.llm import LLMClient
+        with (
+            patch.object(LLMClient, '_init_backend'),
+            patch("src.services.compaction._get_encoder", return_value=None),
+        ):
+            client = LLMClient(Config())
+            assert client.estimate_tokens("") == 1
+            assert client.estimate_tokens("aaaa") == 2
+            assert client.estimate_tokens("a" * 40) == 11
 
 
 class TestMessageConversion:

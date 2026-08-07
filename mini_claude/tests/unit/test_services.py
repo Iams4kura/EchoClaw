@@ -74,10 +74,12 @@ class TestContextCompactor:
         assert not self.compactor.needs_compaction(messages)
 
     def test_needs_compaction_true(self):
-        # Create a huge message
-        big_text = "x" * (200000 * 4)  # ~200k tokens
+        compactor = ContextCompactor(max_tokens=100, threshold=0.9)
+        # Repeated words still produce far more than 90 tokens with tiktoken,
+        # unlike a repeated single character which compresses into large tokens.
+        big_text = "token " * 1_000
         messages = [Message(role="user", content=big_text)]
-        assert self.compactor.needs_compaction(messages)
+        assert compactor.needs_compaction(messages)
 
     @pytest.mark.asyncio
     async def test_truncate_tool_results(self):
@@ -108,11 +110,13 @@ class TestContextCompactor:
             Message(role="assistant", content="a3"),
             Message(role="user", content="fourth"),
         ]
-        result = self.compactor._summarize_early(messages)
+        self.compactor._llm_summarize = AsyncMock(return_value="concise summary")
+        result = await self.compactor._summarize_early(messages)
         assert len(result) < len(messages)
         # Should keep first 2 and last 4
         assert result[0].get_text() == "system"
         assert result[-1].get_text() == "fourth"
+        self.compactor._llm_summarize.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_hard_truncate(self):

@@ -1,21 +1,20 @@
 """P3 测试 — BaseAdapter + 中间件 + 飞书/企微适配器。"""
 
-import asyncio
 import json
 import time
-import xml.etree.ElementTree as ET
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from script.gateway.adapters.feishu import FeishuAdapter
+from script.gateway.adapters.feishu import _split_message as feishu_split
+from script.gateway.adapters.wecom import WecomAdapter
+from script.gateway.adapters.wecom import _split_message as wecom_split
 from script.gateway.base_adapter import BaseAdapter
-from script.gateway.models import BotResponse, UnifiedMessage
 from script.gateway.middleware.auth import AuthManager, UserRole
-from script.gateway.middleware.rate_limit import RateLimiter, TokenBucket
 from script.gateway.middleware.logging_mw import MessageLogger
-from script.gateway.adapters.feishu import FeishuAdapter, _split_message as feishu_split
-from script.gateway.adapters.wecom import WecomAdapter, _split_message as wecom_split
-
+from script.gateway.middleware.rate_limit import RateLimiter, TokenBucket
+from script.gateway.models import BotResponse, UnifiedMessage
 
 # ─── BaseAdapter ─────────────────────────────────────────────
 
@@ -44,8 +43,8 @@ class TestBaseAdapter:
 
     @pytest.mark.asyncio
     async def test_dispatch_calls_session_manager(self):
-        mgr = MagicMock()
-        session = AsyncMock()
+        mgr = MagicMock(spec_set=["get_or_create"])
+        session = MagicMock(spec_set=["handle"])
         session.handle = AsyncMock(return_value="hello")
         mgr.get_or_create = AsyncMock(return_value=session)
 
@@ -212,16 +211,18 @@ class TestMessageLogger:
 
 class TestFeishuAdapter:
     def _make_adapter(self):
-        mgr = MagicMock()
-        session = AsyncMock()
+        mgr = MagicMock(spec_set=["get_or_create"])
+        session = MagicMock(spec_set=["handle"])
         session.handle = AsyncMock(return_value="pong")
         mgr.get_or_create = AsyncMock(return_value=session)
-        return FeishuAdapter(
-            session_manager=mgr,
+        adapter = FeishuAdapter(
+            handler=mgr,
             app_id="test_id",
             app_secret="test_secret",
             verification_token="test_token",
-        ), mgr
+        )
+        adapter.send = AsyncMock()
+        return adapter, mgr
 
     def test_platform(self):
         adapter, _ = self._make_adapter()
@@ -319,16 +320,18 @@ class TestFeishuAdapter:
 
 class TestWecomAdapter:
     def _make_adapter(self):
-        mgr = MagicMock()
-        session = AsyncMock()
+        mgr = MagicMock(spec_set=["get_or_create"])
+        session = MagicMock(spec_set=["handle"])
         session.handle = AsyncMock(return_value="pong")
         mgr.get_or_create = AsyncMock(return_value=session)
-        return WecomAdapter(
-            session_manager=mgr,
+        adapter = WecomAdapter(
+            handler=mgr,
             corp_id="test_corp",
             corp_secret="test_secret",
             webhook_url="https://example.com/webhook",
-        ), mgr
+        )
+        adapter.send = AsyncMock()
+        return adapter, mgr
 
     def test_platform(self):
         adapter, _ = self._make_adapter()

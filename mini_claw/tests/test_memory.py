@@ -1,14 +1,11 @@
 """测试记忆系统。"""
 
-import os
-import tempfile
-
 import pytest
 
+from script.memory.extractor import MemoryExtractor
+from script.memory.loader import MemoryLoader
 from script.memory.models import MemoryEntry, MemoryType
 from script.memory.store import MemoryStore
-from script.memory.loader import MemoryLoader
-from script.memory.extractor import MemoryExtractor
 
 
 class TestMemoryEntry:
@@ -273,13 +270,10 @@ class TestMemoryLoader:
 class TestMemoryExtractor:
     """MemoryExtractor 测试。"""
 
-    def test_no_llm_returns_empty(self) -> None:
+    async def test_no_llm_returns_empty(self) -> None:
         extractor = MemoryExtractor(llm_client=None)
-        import asyncio
-        result = asyncio.get_event_loop().run_until_complete(
-            extractor.extract(
-                conversation=[{"role": "user", "content": "hello"}]
-            )
+        result = await extractor.extract(
+            conversation=[{"role": "user", "content": "hello"}]
         )
         assert result == []
 

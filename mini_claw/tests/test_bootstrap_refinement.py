@@ -7,15 +7,12 @@
 4. USER.md 的称呼填写到 `- **称呼：** ` 位置
 """
 
-from unittest.mock import AsyncMock, MagicMock, patch
-
-import pytest
+from unittest.mock import AsyncMock, MagicMock
 
 from script.brain.cognitive import CognitiveLoop
 from script.brain.conversation import ConversationStore
 from script.brain.models import Intent, IntentType
 from script.gateway.models import UnifiedMessage
-
 
 # ── Fixtures ────────────────────────────────────────────────────
 
@@ -93,6 +90,24 @@ def _make_cognitive(
     return loop
 
 
+async def _capture_reflection_prompt(
+    loop: CognitiveLoop,
+    filename: str,
+    current_content: str,
+    convo_text: str,
+) -> str:
+    """调用真实的逐文件反思入口，并返回实际发送给 LLM 的提示词。"""
+    loop._llm.think = AsyncMock(return_value="无需更新")
+    await loop._reflect_for_file(
+        filename,
+        current_content,
+        convo_text,
+        loop._FILE_INSTRUCTIONS[filename],
+        is_bootstrap=True,
+    )
+    return loop._llm.think.await_args.args[1]
+
+
 # ── 验收标准 1：系统消息不触发自我成长 ──────────────────────────
 
 
@@ -106,7 +121,12 @@ class TestSystemMessageFiltering:
             content="你刚刚首次醒来，向主人打招呼并开始引导。",
             metadata={"system_origin": True, "system_type": "bootstrap"},
         )
-        intent = Intent(type=IntentType.CHITCHAT, confidence=0.9, summary="系统引导", requires_engine=False)
+        intent = Intent(
+            type=IntentType.CHITCHAT,
+            confidence=0.9,
+            summary="系统引导",
+            requires_engine=False,
+        )
 
         result = loop._should_reflect(msg, intent)
 
@@ -116,7 +136,12 @@ class TestSystemMessageFiltering:
         """普通用户消息在 bootstrap 阶段应该触发 _should_reflect。"""
         loop = _make_cognitive(bootstrap_prompt="引导流程...")
         msg = _make_msg(content="我叫 sakura")
-        intent = Intent(type=IntentType.CHITCHAT, confidence=0.9, summary="用户自我介绍", requires_engine=False)
+        intent = Intent(
+            type=IntentType.CHITCHAT,
+            confidence=0.9,
+            summary="用户自我介绍",
+            requires_engine=False,
+        )
 
         result = loop._should_reflect(msg, intent)
 
@@ -138,15 +163,20 @@ class TestSystemMessageFiltering:
         loop._llm.think = AsyncMock(return_value="无需更新")
 
         msg = _make_msg(content="我叫 sakura")
-        intent = Intent(type=IntentType.CHITCHAT, confidence=0.9, summary="自我介绍", requires_engine=False)
+        intent = Intent(
+            type=IntentType.CHITCHAT,
+            confidence=0.9,
+            summary="自我介绍",
+            requires_engine=False,
+        )
         await loop._reflect_and_grow(msg, "sakura 你好！", intent)
 
-        # 验证 LLM 被调用了（说明过滤后还有内容）
-        loop._llm.think.assert_called_once()
-        # 验证传入的 prompt 不包含系统引导内容
-        call_args = loop._llm.think.call_args
-        judge_prompt = call_args[0][1]  # 第二个位置参数
-        assert "系统引导内容" not in judge_prompt, "对话历史中不应包含 system_origin 消息"
+        # Bootstrap 阶段会分别检查核心三件套；每个提示词都必须过滤系统消息。
+        assert loop._llm.think.await_count == len(loop._FILE_INSTRUCTIONS) == 3
+        for call in loop._llm.think.await_args_list:
+            reflection_prompt = call.args[1]
+            assert "系统引导内容" not in reflection_prompt
+            assert "我叫 sakura" in reflection_prompt
 
 
 # ── 验收标准 2：引导不会因一句话就结束 ──────────────────────────
@@ -181,7 +211,6 @@ class TestBootstrapCompletion:
         loop._bootstrap_turns = 1
 
         is_enough_turns = loop._bootstrap_turns >= 3
-        is_user_skipping = False  # chitchat，没有跳过
 
         assert is_enough_turns is False, "1轮对话不满足引导完成的轮数条件"
 
@@ -205,7 +234,12 @@ class TestBootstrapCompletion:
 
     def test_bootstrap_skipped_by_coding_intent(self) -> None:
         """用户直接发编码任务时应可跳过引导（C条件）。"""
-        skip_intents = [IntentType.CODING, IntentType.STATUS, IntentType.KNOWLEDGE, IntentType.COMPLEX]
+        skip_intents = [
+            IntentType.CODING,
+            IntentType.STATUS,
+            IntentType.KNOWLEDGE,
+            IntentType.COMPLEX,
+        ]
         for intent_type in skip_intents:
             is_user_skipping = intent_type in (
                 IntentType.CODING, IntentType.STATUS, IntentType.KNOWLEDGE, IntentType.COMPLEX
@@ -256,54 +290,47 @@ class TestBootstrapCompletion:
 class TestPromptPollutionPrevention:
     """验收标准3：IDENTITY.md 不再出现提示词内容。"""
 
-    def test_judge_prompt_contains_source_distinction(self) -> None:
-        """judge_prompt 应包含消息来源区分说明。"""
+    async def test_reflection_prompt_contains_source_distinction(self) -> None:
+        """实际发送给 LLM 的提示词应明确区分消息来源。"""
         loop = _make_cognitive(bootstrap_prompt="引导流程...")
-        # 构造对话历史
-        loop._conversation.add("test_user", "user", "叫我 sakura 吧")
-        loop._conversation.add("test_user", "assistant", "好的 sakura！")
+        prompt = await _capture_reflection_prompt(
+            loop,
+            "USER.md",
+            "# USER\n\n- **称呼：** 主人",
+            "user: 叫我 sakura 吧\nassistant: 好的 sakura！",
+        )
 
-        # 直接构建 judge_prompt 并检查内容
-        recent = loop._conversation.get_full("test_user")[-6:]
-        recent = [t for t in recent if not (t.metadata or {}).get("system_origin")]
-        convo_text = "\n".join(f"{t.role}: {t.content[:300]}" for t in recent)
-
-        # 重现 _reflect_and_grow 中的 judge_prompt 构建
-        judge_prompt = f"""你是一个自我成长引擎。阅读以下对话，判断是否有值得长期保留的信息。
-
-        最近对话：
-        {convo_text}
-        """
-
-        # 验证关键防污染提示词存在于完整的 judge_prompt 中
-        # （由于我们不能直接调用私有方法的中间结果，验证代码中静态存在即可）
-        source_code_lines = [
+        source_rules = [
             "区分消息来源",
-            "系统给你的提示词",
-            "不要",
-            "格式要求",
+            "role=user",
+            "role=assistant",
+            "系统提示词/引导指令",
+            "不是事实，不要写入文件",
         ]
-        # 这些关键字应存在于 cognitive.py 源码的 judge_prompt 构建部分
-        import inspect
-        source = inspect.getsource(loop._reflect_and_grow)
-        for keyword in source_code_lines:
-            assert keyword in source, f"_reflect_and_grow 源码应包含 '{keyword}'"
+        for rule in source_rules:
+            assert rule in prompt
 
-    def test_judge_prompt_has_format_requirements(self) -> None:
-        """judge_prompt 源码应包含格式要求（防止追加到错误位置）。"""
-        import inspect
-        loop = _make_cognitive()
-        source = inspect.getsource(loop._reflect_and_grow)
+    async def test_reflection_prompt_has_format_requirements(self) -> None:
+        """逐文件提示词应要求完整、原地且保持结构地更新文件。"""
+        loop = _make_cognitive(bootstrap_prompt="引导流程...")
+        prompt = await _capture_reflection_prompt(
+            loop,
+            "USER.md",
+            "# USER\n\n- **称呼：** 主人",
+            "user: 叫我 sakura 吧",
+        )
 
         format_keywords = [
             "称呼",
             "USER.md",
-            "IDENTITY.md",
-            "语气风格",
-            "不要创建新的",
+            "完整文件内容",
+            "直接原地修改",
+            "不要在末尾追加重复信息",
+            "保持文件原有的 markdown 格式和结构",
+            "不要创建新的 ## 章节",
         ]
         for kw in format_keywords:
-            assert kw in source, f"judge_prompt 应包含格式要求 '{kw}'"
+            assert kw in prompt, f"反思提示词应包含格式要求 '{kw}'"
 
 
 # ── 验收标准 4：格式正确性 ──────────────────────────────────────
@@ -312,14 +339,21 @@ class TestPromptPollutionPrevention:
 class TestFormatCorrectness:
     """验收标准4：USER.md 的称呼填写到正确位置。"""
 
-    def test_judge_prompt_specifies_template_format(self) -> None:
-        """judge_prompt 应明确要求替换（暂无）占位符。"""
-        import inspect
-        loop = _make_cognitive()
-        source = inspect.getsource(loop._reflect_and_grow)
+    async def test_reflection_prompt_preserves_current_template(self) -> None:
+        """提示词应携带当前模板，并要求在既有「称呼」字段原地修改。"""
+        loop = _make_cognitive(bootstrap_prompt="引导流程...")
+        current_content = "# USER\n\n## 基本信息\n\n- **称呼：** 主人"
+        prompt = await _capture_reflection_prompt(
+            loop,
+            "USER.md",
+            current_content,
+            "user: 叫我 sakura 吧",
+        )
 
-        assert "（暂无）" in source, "judge_prompt 应提及替换（暂无）占位符"
-        assert "SECTION" in source or "章节" in source, "judge_prompt 应提及章节定位"
+        assert current_content in prompt
+        assert "修改「称呼」字段为 sakura" in prompt
+        assert "直接原地修改" in prompt
+        assert "不要创建新的 ## 章节" in prompt
 
 
 # ── ConversationStore metadata 支持测试 ─────────────────────────
@@ -355,7 +389,7 @@ class TestConversationStoreMetadata:
         filtered = [t for t in recent if not (t.metadata or {}).get("system_origin")]
 
         assert len(filtered) == 3, "过滤后应剩3条（1条系统消息被移除）"
-        assert all("系统消息" != t.content for t in filtered), "系统消息应被过滤"
+        assert all(t.content != "系统消息" for t in filtered), "系统消息应被过滤"
 
 
 # ── UnifiedMessage metadata 测试 ────────────────────────────────
