@@ -1,5 +1,6 @@
 """测试调度系统。"""
 
+import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -142,6 +143,88 @@ class TestTaskManager:
         assert await task_mgr.cancel(task.id) is False
 
         await mgr.shutdown()
+
+    async def test_cancel_while_routing_does_not_start_task(self) -> None:
+        """路由中的任务被取消后，不得恢复为运行态或启动执行。"""
+        route_started = asyncio.Event()
+        route_release = asyncio.Event()
+        runner = MagicMock()
+        runner.execute = AsyncMock(return_value="late result")
+
+        async def delayed_route(message: UnifiedMessage) -> tuple:
+            route_started.set()
+            await route_release.wait()
+            routed = Task(source_message=message, assigned_avatar="general")
+            return runner, routed
+
+        on_complete = AsyncMock()
+        task_mgr = TaskManager(
+            avatar_manager=MagicMock(),
+            on_task_complete=on_complete,
+        )
+        task_mgr._router.route = delayed_route
+        task = Task(source_message=_make_msg("hello"))
+        await task_mgr.submit(task)
+
+        process_task = asyncio.create_task(task_mgr.process_next())
+        await route_started.wait()
+
+        assert await task_mgr.cancel(task.id) is True
+        assert task.status == TaskStatus.CANCELLED
+
+        route_release.set()
+        assert await process_task is task
+
+        assert task.status == TaskStatus.CANCELLED
+        assert task.result is None
+        runner.execute.assert_not_awaited()
+        assert task.id not in task_mgr._execution_tasks
+        on_complete.assert_awaited_once_with(task)
+
+    @pytest.mark.parametrize("swallow_cancel", [False, True])
+    async def test_cancel_while_executing_stays_cancelled(
+        self, swallow_cancel: bool,
+    ) -> None:
+        """执行中的取消必须清理任务，且忽略不合作执行器的迟到结果。"""
+        execution_started = asyncio.Event()
+
+        async def execute(task_id: str, content: str) -> str:
+            execution_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if swallow_cancel:
+                    return "late result"
+                raise
+
+        runner = MagicMock()
+        runner.execute = AsyncMock(side_effect=execute)
+        routed = Task(assigned_avatar="general")
+
+        on_complete = AsyncMock()
+        task_mgr = TaskManager(
+            avatar_manager=MagicMock(),
+            on_task_complete=on_complete,
+        )
+        task_mgr._router.route = AsyncMock(return_value=(runner, routed))
+        task = Task(source_message=_make_msg("long task"))
+        await task_mgr.submit(task)
+
+        assert await task_mgr.process_next() is task
+        await execution_started.wait()
+        assert task.status == TaskStatus.RUNNING
+        execution_task = task_mgr._execution_tasks[task.id]
+
+        assert await task_mgr.cancel(task.id) is True
+        try:
+            await execution_task
+        except asyncio.CancelledError:
+            pass
+
+        assert task.status == TaskStatus.CANCELLED
+        assert task.result is None
+        assert task.id not in task_mgr._execution_tasks
+        on_complete.assert_awaited_once_with(task)
 
     @patch("src.engine.headless.create_engine")
     async def test_stats(self, mock_create: AsyncMock) -> None:
