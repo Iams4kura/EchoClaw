@@ -136,16 +136,18 @@ class RoutineScheduler:
     async def start(self) -> None:
         """启动调度循环。
 
-        首次启动时将所有任务的 last_run 初始化为当前时间，
-        避免 HOURLY 等周期性任务在启动后立刻触发。
-        DAILY/WEEKLY 任务按时间点匹配，不受此影响。
+        首次启动时仅初始化 HOURLY 任务的 last_run，避免间隔任务立即触发。
+        其他频率依赖“从未运行”的状态判断首次触发，不能提前标记。
         """
         if self._running:
             return
         self._running = True
         now = time.time()
         for job in self._jobs:
-            if job.name not in self._last_run:
+            if (
+                job.frequency == RoutineFrequency.HOURLY
+                and job.name not in self._last_run
+            ):
                 self._last_run[job.name] = now
         self._task = asyncio.create_task(self._loop())
 

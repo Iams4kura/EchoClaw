@@ -100,6 +100,25 @@ class TestSchedulerCronMatch:
 
 
 class TestSchedulerShouldRun:
+    async def test_start_only_primes_interval_jobs(self) -> None:
+        s = RoutineScheduler()
+        s._jobs.extend(
+            RoutineJob(
+                name=f"{frequency.value}_job",
+                description="",
+                prompt="",
+                frequency=frequency,
+                cron_expr="* * * * *" if frequency == RoutineFrequency.CRON else "",
+            )
+            for frequency in RoutineFrequency
+        )
+
+        await s.start()
+        try:
+            assert set(s._last_run) == {"hourly_job"}
+        finally:
+            await s.stop()
+
     def test_once_never_ran(self) -> None:
         s = RoutineScheduler()
         job = RoutineJob(name="once_job", description="", prompt="", frequency=RoutineFrequency.ONCE)
