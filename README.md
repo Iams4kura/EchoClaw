@@ -65,7 +65,7 @@ EchoClaw 由两个子项目组成：
 ### 环境要求
 
 - Python 3.10+
-- Node.js 18+（仅 mini_claw Web 控制台需要）
+- Node.js 22.12+（仅 mini_claw Web 控制台需要）
 - 一个 LLM API Key（OpenAI 兼容接口即可，如 Anthropic、DeepSeek、通义千问等）
 
 ### mini_claude — 终端助手
@@ -320,14 +320,31 @@ python -m pytest mini_claude/tests
 python -m pytest mini_claw/tests
 ```
 
-### 构建 Web 控制台
+### 开发 Web 控制台
+
+先在一个终端启动后端（默认监听 `http://localhost:8080`）：
+
+```bash
+cd mini_claw
+mclaw
+```
+
+再在另一个终端启动前端开发服务器：
 
 ```bash
 cd mini_claw/web
-npm install
-npm run dev      # 开发模式
-npm run build    # 构建生产版本
+npm ci
+npm run dev
 ```
+
+前端默认在 `http://localhost:5173`，并将 API 请求代理到后端的 `8080` 端口。
+如后端使用其他地址，可通过 `VITE_API_TARGET` 覆盖，例如：
+
+```bash
+VITE_API_TARGET=http://localhost:9000 npm run dev
+```
+
+生产构建使用 `npm run build`。
 
 ### 代码规范
 
