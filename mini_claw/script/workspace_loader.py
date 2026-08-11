@@ -38,7 +38,7 @@ class WorkspaceLoader:
     """
 
     def __init__(self, workspace_dir: str) -> None:
-        self._root = Path(workspace_dir)
+        self._root = Path(workspace_dir).resolve()
 
     @property
     def root(self) -> Path:
@@ -47,25 +47,38 @@ class WorkspaceLoader:
     @property
     def memory_dir(self) -> str:
         """记忆文件目录路径。"""
-        return str(self._root / "memory")
+        return str(self._resolve_path("memory"))
 
     @property
     def memory_index_path(self) -> str:
         """MEMORY.md 的路径（workspace 根目录）。"""
-        return str(self._root / "MEMORY.md")
+        return str(self._resolve_path("MEMORY.md"))
 
     # ── 文件读取 ─────────────────────────────────────────────
 
+    def _resolve_path(self, filename: str) -> Path:
+        """解析 workspace 内路径，拒绝目录穿越和软链接逃逸。"""
+        candidate = Path(filename)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise ValueError(f"不安全的路径: {filename}")
+
+        try:
+            resolved = (self._root / candidate).resolve(strict=False)
+            resolved.relative_to(self._root)
+        except (RuntimeError, ValueError):
+            raise ValueError(f"不安全的路径: {filename}") from None
+        return resolved
+
     def _read(self, filename: str) -> str:
         """读取 workspace 下的文件，不存在返回空字符串。"""
-        path = self._root / filename
+        path = self._resolve_path(filename)
         if path.exists():
             return path.read_text(encoding="utf-8")
         return ""
 
     def _write(self, filename: str, content: str) -> None:
         """写入 workspace 下的文件。"""
-        path = self._root / filename
+        path = self._resolve_path(filename)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
 
@@ -194,7 +207,7 @@ class WorkspaceLoader:
 
     def is_first_boot(self) -> bool:
         """BOOTSTRAP.md 是否存在（首次启动标记）。"""
-        return (self._root / "BOOTSTRAP.md").exists()
+        return self._resolve_path("BOOTSTRAP.md").exists()
 
     def load_bootstrap(self) -> str:
         """读取 BOOTSTRAP.md 内容。不存在返回空字符串。"""
@@ -202,7 +215,7 @@ class WorkspaceLoader:
 
     def complete_bootstrap(self) -> None:
         """删除 BOOTSTRAP.md，标记引导完成。"""
-        path = self._root / "BOOTSTRAP.md"
+        path = self._resolve_path("BOOTSTRAP.md")
         if path.exists():
             path.unlink()
             logger.info("首次引导完成，已删除 BOOTSTRAP.md")
@@ -355,17 +368,18 @@ class WorkspaceLoader:
         logger.info("Workspace update_section: %s ## %s", filename, section)
 
     def _validate_path(self, filename: str) -> None:
-        """校验路径安全：禁止 .. 和绝对路径。"""
-        if ".." in filename or filename.startswith("/"):
-            raise ValueError(f"不安全的路径: {filename}")
+        """校验路径安全：路径必须解析到 workspace 内。"""
+        self._resolve_path(filename)
 
     def _validate_writable(self, filename: str) -> None:
         """校验文件是否可写：白名单文件 或 memory/ 子目录。"""
-        if filename in self.EDITABLE_FILES:
+        relative_path = self._resolve_path(filename).relative_to(self._root)
+        relative_name = relative_path.as_posix()
+        if relative_name in self.EDITABLE_FILES:
             return
-        if filename.startswith("memory/"):
+        if relative_path.parts and relative_path.parts[0] == "memory":
             return
-        if filename.startswith(".openclaw/"):
+        if relative_path.parts and relative_path.parts[0] == ".openclaw":
             return
         raise ValueError(
             f"不可编辑的文件: {filename}。"
@@ -376,8 +390,16 @@ class WorkspaceLoader:
 
     def _diary_filename(self, dt: Optional[str] = None) -> str:
         """日记文件的 workspace 相对路径。"""
-        d = dt or date.today().isoformat()
-        return f"memory/{d}.md"
+        if dt is None:
+            diary_date = date.today()
+        else:
+            try:
+                diary_date = date.fromisoformat(dt)
+            except (TypeError, ValueError):
+                raise ValueError("日记日期必须使用 YYYY-MM-DD 格式") from None
+            if diary_date.isoformat() != dt:
+                raise ValueError("日记日期必须使用 YYYY-MM-DD 格式")
+        return f"memory/{diary_date.isoformat()}.md"
 
     def read_diary(self, dt: str = "") -> str:
         """读取指定日期的日记。不指定则读今天。"""
